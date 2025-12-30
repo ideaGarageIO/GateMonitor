@@ -10,9 +10,15 @@
     <div class="container">
         <header>
             <h1>Gate Monitor</h1>
-            <div id="connection-status" class="connection-status offline">
-                <span class="status-dot"></span>
-                <span class="status-text">Disconnected</span>
+            <div class="connection-indicators">
+                <div id="ws-status" class="connection-status offline" title="WebSocket connection to server">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Server</span>
+                </div>
+                <div id="mqtt-status" class="connection-status offline" title="MQTT broker connection">
+                    <span class="status-dot"></span>
+                    <span class="status-text">MQTT</span>
+                </div>
             </div>
         </header>
 

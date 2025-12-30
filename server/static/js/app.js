@@ -11,7 +11,8 @@ const RECONNECT_DELAY = 3000;
 
 // DOM Elements
 const elements = {
-    connectionStatus: document.getElementById('connection-status'),
+    wsStatus: document.getElementById('ws-status'),
+    mqttStatus: document.getElementById('mqtt-status'),
     gateState: document.getElementById('gate-state'),
     gateOnline: document.getElementById('gate-online'),
     batteryValue: document.getElementById('battery-value'),
@@ -98,6 +99,11 @@ function handleMessage(message) {
  * Update the UI with new status data
  */
 function updateStatus(data) {
+    // MQTT connection status
+    if (data.mqtt_connected !== undefined) {
+        updateMqttStatus(data.mqtt_connected);
+    }
+
     // Gate state
     const state = data.state.toLowerCase();
     elements.gateState.className = `gate-state ${state}`;
@@ -170,13 +176,22 @@ function formatTime(date) {
 }
 
 /**
- * Update connection status indicator
+ * Update WebSocket connection status indicator
  */
 function updateConnectionStatus(connected) {
-    elements.connectionStatus.className =
+    elements.wsStatus.className =
         `connection-status ${connected ? 'online' : 'offline'}`;
-    elements.connectionStatus.querySelector('.status-text').textContent =
-        connected ? 'Connected' : 'Disconnected';
+    elements.wsStatus.querySelector('.status-text').textContent =
+        connected ? 'Server' : 'Server';
+}
+
+/**
+ * Update MQTT connection status indicator
+ */
+function updateMqttStatus(connected) {
+    elements.mqttStatus.className =
+        `connection-status ${connected ? 'online' : 'offline'}`;
+    elements.mqttStatus.querySelector('.status-text').textContent = 'MQTT';
 }
 
 /**

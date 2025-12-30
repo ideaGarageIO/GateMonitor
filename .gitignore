@@ -41,6 +41,10 @@ ENV/
 build/
 .pio/
 
+# Credentials (keep secrets out of git)
+credentials.h
+**/credentials.h
+
 # Environment variables
 .env
 .env.local

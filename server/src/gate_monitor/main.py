@@ -1,76 +1,113 @@
-"""FastAPI application for gate monitor."""
+"""FastAPI application for gate monitor.
+
+This module provides the web server for the gate monitoring system.
+It serves a real-time dashboard via WebSocket and exposes REST API
+endpoints for status queries and command submission.
+
+The server connects to an MQTT broker (Mosquitto) to receive gate
+status updates from the LoRa gateway and to publish control commands.
+"""
 
 import asyncio
 import json
 import logging
 import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .models import Command, GateStatus
-from .mqtt_client import MQTTClient
 
-# Load environment variables
+from gate_monitor.database import close_db, get_db, init_db
+from gate_monitor.models import Command, GateStatus
+from gate_monitor.mqtt_client import MQTTClient
+
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# MQTT configuration from environment
+# Configuration from environment
 MQTT_HOST = os.getenv("MQTT_HOST", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 
-# Paths
 STATIC_DIR = Path(__file__).parent.parent.parent / "static"
 
 # Global state
 mqtt_client: Optional[MQTTClient] = None
 connected_websockets: set[WebSocket] = set()
+last_recorded_state: Optional[str] = None
 
 
 async def broadcast_status(status: GateStatus) -> None:
-    """Broadcast status update to all connected WebSocket clients."""
+    """Broadcast a status update to all connected WebSocket clients.
+
+    Sends the status as a JSON message to each connected client.
+    Automatically removes clients that have disconnected.
+
+    Args:
+        status: The current gate status to broadcast.
+    """
     if not connected_websockets:
         return
 
-    message = json.dumps({"type": "status", "data": status.to_dict()})
+    status_dict = status.to_dict()
+    if mqtt_client:
+        status_dict["mqtt_connected"] = mqtt_client.is_connected
+    else:
+        status_dict["mqtt_connected"] = False
 
-    # Send to all connected clients
-    disconnected = set()
+    message = json.dumps({"type": "status", "data": status_dict})
+
+    disconnected: set[WebSocket] = set()
     for ws in connected_websockets:
         try:
             await ws.send_text(message)
         except Exception:
             disconnected.add(ws)
 
-    # Remove disconnected clients
     for ws in disconnected:
         connected_websockets.discard(ws)
 
 
 def on_status_update(status: GateStatus) -> None:
-    """Callback for MQTT status updates - schedules async broadcast."""
+    """Handle MQTT status updates by scheduling an async broadcast.
+
+    This callback is invoked by the MQTT client when a new status
+    message is received. It creates an asyncio task to broadcast
+    the update to all WebSocket clients.
+
+    Args:
+        status: The updated gate status from MQTT.
+    """
     asyncio.create_task(broadcast_status(status))
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager."""
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Manage application startup and shutdown lifecycle.
+
+    On startup, initializes the MQTT client and connects to the broker.
+    On shutdown, cleanly disconnects from the broker.
+
+    Args:
+        app: The FastAPI application instance.
+
+    Yields:
+        None during application runtime.
+    """
     global mqtt_client
 
-    # Startup
     logger.info("Starting Gate Monitor server")
 
     mqtt_client = MQTTClient(
@@ -84,17 +121,15 @@ async def lifespan(app: FastAPI):
     try:
         mqtt_client.connect()
     except Exception as e:
-        logger.error(f"Failed to connect to MQTT: {e}")
+        logger.error("Failed to connect to MQTT: %s", e)
 
     yield
 
-    # Shutdown
     logger.info("Shutting down Gate Monitor server")
     if mqtt_client:
         mqtt_client.disconnect()
 
 
-# Create FastAPI app
 app = FastAPI(
     title="Gate Monitor",
     description="Web interface for LoRa gate monitoring system",
@@ -102,14 +137,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Mount static files
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.get("/")
-async def root():
-    """Serve the main dashboard."""
+async def root() -> Any:
+    """Serve the main dashboard page.
+
+    Returns:
+        The index.html file if it exists, otherwise an error dict.
+    """
     index_path = STATIC_DIR / "index.html"
     if index_path.exists():
         return FileResponse(index_path)
@@ -117,24 +155,48 @@ async def root():
 
 
 @app.get("/api/status")
-async def get_status():
-    """Get current gate status."""
+async def get_status() -> dict[str, Any]:
+    """Get the current gate status.
+
+    Returns:
+        A dictionary containing the current gate state, battery voltage,
+        signal quality, and online status. Returns an error if MQTT is
+        not connected.
+    """
     if mqtt_client:
-        return mqtt_client.status.to_dict()
-    return {"error": "MQTT not connected"}
+        status_dict = mqtt_client.status.to_dict()
+        status_dict["mqtt_connected"] = mqtt_client.is_connected
+        return status_dict
+    return {"error": "MQTT not connected", "mqtt_connected": False}
 
 
 @app.get("/api/history")
-async def get_history():
-    """Get status history."""
+async def get_history() -> list[dict[str, Any]]:
+    """Get the gate status history.
+
+    Returns:
+        A list of historical status entries, each containing timestamp,
+        state, and battery voltage. Returns empty list if MQTT is not
+        connected.
+    """
     if mqtt_client:
         return [entry.to_dict() for entry in mqtt_client.history]
     return []
 
 
 @app.post("/api/command/{command}")
-async def send_command(command: str):
-    """Send a command to the gate."""
+async def send_command(command: str) -> dict[str, Any]:
+    """Send a control command to the gate.
+
+    Args:
+        command: The command to send. Valid values are "open", "close",
+            "stop", and "status" (case-insensitive).
+
+    Returns:
+        A dictionary with status "sent" and the command name on success,
+        or an error message if the command is invalid or MQTT is not
+        connected.
+    """
     cmd = Command.from_string(command)
     if cmd is None:
         return {"error": f"Invalid command: {command}"}
@@ -147,20 +209,34 @@ async def send_command(command: str):
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time updates."""
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    """WebSocket endpoint for real-time status updates.
+
+    Clients connecting to this endpoint will receive immediate status
+    updates whenever the gate state changes. Clients can also send
+    commands through the WebSocket connection.
+
+    Args:
+        websocket: The WebSocket connection.
+
+    Message Format (server -> client):
+        {"type": "status", "data": {...status fields...}}
+
+    Message Format (client -> server):
+        {"type": "command", "command": "open|close|stop|status"}
+    """
     await websocket.accept()
     connected_websockets.add(websocket)
-    logger.info(f"WebSocket connected. Total: {len(connected_websockets)}")
+    logger.info("WebSocket connected. Total: %d", len(connected_websockets))
 
     try:
-        # Send current status immediately
         if mqtt_client:
+            status_dict = mqtt_client.status.to_dict()
+            status_dict["mqtt_connected"] = mqtt_client.is_connected
             await websocket.send_text(
-                json.dumps({"type": "status", "data": mqtt_client.status.to_dict()})
+                json.dumps({"type": "status", "data": status_dict})
             )
 
-        # Keep connection alive and handle incoming messages
         while True:
             data = await websocket.receive_text()
             try:
@@ -170,17 +246,26 @@ async def websocket_endpoint(websocket: WebSocket):
                     if cmd and mqtt_client:
                         mqtt_client.send_command(cmd)
             except json.JSONDecodeError:
-                pass
+                logger.debug("Received invalid JSON from WebSocket")
 
     except WebSocketDisconnect:
         pass
     finally:
         connected_websockets.discard(websocket)
-        logger.info(f"WebSocket disconnected. Total: {len(connected_websockets)}")
+        logger.info("WebSocket disconnected. Total: %d", len(connected_websockets))
 
 
-def run():
-    """Entry point for the server."""
+def run() -> None:
+    """Entry point for running the server.
+
+    Reads configuration from environment variables and starts the
+    uvicorn server. Enable DEBUG=true for auto-reload during development.
+
+    Environment Variables:
+        HOST: Server bind address (default: 0.0.0.0)
+        PORT: Server port (default: 8000)
+        DEBUG: Enable auto-reload (default: false)
+    """
     import uvicorn
 
     host = os.getenv("HOST", "0.0.0.0")

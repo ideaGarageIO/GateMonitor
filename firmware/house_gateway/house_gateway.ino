@@ -4,6 +4,8 @@
  *
  * Receives gate status over LoRa and publishes to MQTT.
  * Receives MQTT commands and forwards to gate over LoRa.
+ *
+ * SETUP: Copy credentials_example.h to credentials.h and fill in your values.
  */
 
 #include "LoRaWan_APP.h"
@@ -14,19 +16,16 @@
 #include "HT_SSD1306Wire.h"
 #include "gate_protocol.h"
 
+// Load credentials from gitignored file
+// Copy credentials_example.h to credentials.h and edit with your values
+#if __has_include("credentials.h")
+    #include "credentials.h"
+#else
+    #error "credentials.h not found! Copy credentials_example.h to credentials.h and add your WiFi/MQTT settings."
+#endif
+
 // Display
 static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
-
-// WiFi Configuration - UPDATE THESE
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-
-// MQTT Configuration
-const char* MQTT_SERVER = "192.168.1.100";  // Raspberry Pi IP
-const int MQTT_PORT = 1883;
-const char* MQTT_USER = "";                  // Optional
-const char* MQTT_PASSWORD = "";              // Optional
-const char* MQTT_CLIENT_ID = "gate_gateway";
 
 // MQTT Topics
 const char* TOPIC_STATUS = "gate/status";
