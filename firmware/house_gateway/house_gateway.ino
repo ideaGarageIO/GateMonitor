@@ -120,8 +120,16 @@ void loop() {
     // Check gate online status (offline if no message for 2x heartbeat interval)
     if (gateOnline && (now - lastGateMessage > HEARTBEAT_INTERVAL * 2)) {
         gateOnline = false;
+        gateState = STATE_UNKNOWN;
         mqtt.publish(TOPIC_ONLINE, "offline", true);
-        Serial.println("Gate went offline");
+
+        // Publish unknown status so server knows state is unknown
+        char json[128];
+        sprintf(json, "{\"state\":\"%s\",\"battery\":%u,\"rssi\":%d,\"snr\":%d,\"online\":false}",
+            stateToString(gateState), gateBattery, lastRssi, lastSnr);
+        mqtt.publish(TOPIC_STATUS, json, true);
+
+        Serial.println("Gate went offline - state set to UNKNOWN");
     }
 
     // Command retry
@@ -227,10 +235,12 @@ void reconnectMQTT() {
             Serial.println("MQTT connected");
 
             // Subscribe to command topic
-            mqtt.subscribe(TOPIC_COMMAND);
+            bool subResult = mqtt.subscribe(TOPIC_COMMAND);
+            Serial.printf("Subscribed to '%s': %s\n", TOPIC_COMMAND, subResult ? "OK" : "FAILED");
 
             // Publish gateway online
             mqtt.publish("gateway/online", "online", true);
+            Serial.println("Published gateway/online: online");
         } else {
             Serial.printf("MQTT failed, rc=%d\n", mqtt.state());
             delay(2000);
@@ -245,25 +255,39 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     memcpy(message, payload, len);
     message[len] = '\0';
 
-    Serial.printf("MQTT RX [%s]: %s\n", topic, message);
+    Serial.println("------ MQTT Message Received ------");
+    Serial.printf("  Topic: %s\n", topic);
+    Serial.printf("  Payload: %s\n", message);
+    Serial.printf("  Length: %u\n", length);
 
     if (strcmp(topic, TOPIC_COMMAND) == 0) {
+        Serial.println("  -> Command topic matched");
         uint8_t cmd = 0;
 
         if (strcasecmp(message, "OPEN") == 0) {
             cmd = CMD_OPEN;
+            Serial.println("  -> Parsed: OPEN");
         } else if (strcasecmp(message, "CLOSE") == 0) {
             cmd = CMD_CLOSE;
+            Serial.println("  -> Parsed: CLOSE");
         } else if (strcasecmp(message, "STOP") == 0) {
             cmd = CMD_STOP;
+            Serial.println("  -> Parsed: STOP");
         } else if (strcasecmp(message, "STATUS") == 0) {
             cmd = CMD_STATUS;
+            Serial.println("  -> Parsed: STATUS");
+        } else {
+            Serial.printf("  -> Unknown command: '%s'\n", message);
         }
 
         if (cmd > 0) {
+            Serial.printf("  -> Sending command %d via LoRa\n", cmd);
             sendCommand(cmd);
         }
+    } else {
+        Serial.println("  -> Topic not handled");
     }
+    Serial.println("-----------------------------------");
 }
 
 void sendCommand(uint8_t cmd) {
@@ -274,12 +298,18 @@ void sendCommand(uint8_t cmd) {
     cmdRetryCount = 0;
 
     formatCommandMessage(txpacket, cmd, commandSeq);
-    Serial.printf("TX Command: %s\n", txpacket);
+    Serial.println("====== Sending LoRa Command ======");
+    Serial.printf("  Command: %s (%d)\n", commandToString(cmd), cmd);
+    Serial.printf("  Sequence: %u\n", commandSeq);
+    Serial.printf("  Packet: %s\n", txpacket);
+    Serial.printf("  LoRa idle: %s\n", lora_idle ? "yes" : "no (queued)");
 
     if (lora_idle) {
         lora_idle = false;
         Radio.Send((uint8_t *)txpacket, strlen(txpacket));
+        Serial.println("  -> LoRa TX started");
     }
+    Serial.println("==================================");
 }
 
 void publishStatus() {
