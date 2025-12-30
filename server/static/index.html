@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gate Monitor</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Gate Monitor</h1>
+            <div id="connection-status" class="connection-status offline">
+                <span class="status-dot"></span>
+                <span class="status-text">Disconnected</span>
+            </div>
+        </header>
+
+        <main>
+            <!-- Gate Status Card -->
+            <section class="card status-card">
+                <h2>Gate Status</h2>
+                <div class="status-display">
+                    <div id="gate-state" class="gate-state unknown">
+                        <span class="state-icon"></span>
+                        <span class="state-text">UNKNOWN</span>
+                    </div>
+                    <div id="gate-online" class="gate-online offline">
+                        <span class="online-dot"></span>
+                        <span class="online-text">Offline</span>
+                    </div>
+                </div>
+                <div class="status-details">
+                    <div class="detail">
+                        <span class="label">Battery</span>
+                        <span id="battery-value" class="value">--</span>
+                        <div class="battery-bar">
+                            <div id="battery-level" class="battery-level"></div>
+                        </div>
+                    </div>
+                    <div class="detail">
+                        <span class="label">Signal (RSSI)</span>
+                        <span id="rssi-value" class="value">--</span>
+                    </div>
+                    <div class="detail">
+                        <span class="label">SNR</span>
+                        <span id="snr-value" class="value">--</span>
+                    </div>
+                    <div class="detail">
+                        <span class="label">Last Update</span>
+                        <span id="last-update" class="value">--</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Control Card -->
+            <section class="card control-card">
+                <h2>Controls</h2>
+                <div class="control-buttons">
+                    <button id="btn-open" class="btn btn-open" onclick="sendCommand('open')">
+                        <span class="btn-icon">&#9650;</span>
+                        Open
+                    </button>
+                    <button id="btn-stop" class="btn btn-stop" onclick="sendCommand('stop')">
+                        <span class="btn-icon">&#9632;</span>
+                        Stop
+                    </button>
+                    <button id="btn-close" class="btn btn-close" onclick="sendCommand('close')">
+                        <span class="btn-icon">&#9660;</span>
+                        Close
+                    </button>
+                </div>
+                <div id="command-feedback" class="command-feedback"></div>
+            </section>
+
+            <!-- History Card -->
+            <section class="card history-card">
+                <h2>Recent Activity</h2>
+                <div id="history-list" class="history-list">
+                    <p class="no-history">No activity recorded</p>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Gate Monitor v0.1.0</p>
+        </footer>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
