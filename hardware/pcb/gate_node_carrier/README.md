@@ -14,6 +14,21 @@ python3 gen_pcb.py --check   # placement sanity check only
 python3 gen_pcb.py           # -> gate_node_carrier.kicad_pcb (+ net classes in .kicad_pro)
 ```
 
+`python3 gen_3d.py` regenerates the placeholder 3D models in `gate_node.3dshapes/`.
+These are box models of the Heltec V3 (attached to J1) and the Mini360 (U1),
+written as VRML for the viewer and STEP for export.
+
+### 3D view / enclosure fit
+
+- Install KiCad's stock models: `sudo apt install kicad-packages3d`
+- In the PCB editor: **View → 3D Viewer** (Alt+3)
+- STEP for enclosure CAD: **File → Export → STEP** and tick *Substitute similarly
+  named models*. From the CLI:
+  `KIPRJMOD=$PWD kicad2step --subst-models -o gate_node_carrier.step gate_node_carrier.kicad_pcb`
+- Heltec stack height: the female sockets are 8.5 mm, the Heltec PCB top is at
+  about 9.5 mm and the OLED top at about 11.9 mm above the carrier. Allow
+  about 25 mm of enclosure height above the carrier for JST cables and wiring.
+
 Regenerating the PCB **overwrites routing**. Once you start routing in
 KiCad, treat the `.kicad_pcb` as hand-edited and use
 *Tools → Update PCB from Schematic* instead. Footprints are already linked

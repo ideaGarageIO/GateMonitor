@@ -448,6 +448,11 @@
       (scale (xyz 1 1 1))
       (rotate (xyz 0 0 0))
     )
+    (model "${KIPRJMOD}/gate_node.3dshapes/Heltec_V3_placeholder.wrl"
+      (offset (xyz 0 0 0))
+      (scale (xyz 1 1 1))
+      (rotate (xyz 0 0 0))
+    )
   )
 
   (footprint "Capacitor_THT:C_Disc_D5.0mm_W2.5mm_P5.00mm" (layer "F.Cu")
@@ -762,6 +767,11 @@
       (net 1 "GND") (tstamp c669b574-f08d-4104-820a-bbe8ad365930))
     (pad "4" thru_hole oval (at 7.3 -4.3) (size 2 2.4) (drill 1.1) (layers *.Cu *.Mask)
       (net 16 "5V_BUCK") (tstamp ee48fc4c-fed2-4434-ba14-1b7b938f70db))
+    (model "${KIPRJMOD}/gate_node.3dshapes/Mini360_placeholder.wrl"
+      (offset (xyz 0 0 0))
+      (scale (xyz 1 1 1))
+      (rotate (xyz 0 0 0))
+    )
   )
 
   (footprint "Diode_THT:D_DO-15_P10.16mm_Horizontal" (layer "F.Cu")

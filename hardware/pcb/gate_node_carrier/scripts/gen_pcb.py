@@ -26,6 +26,10 @@ LOCAL_LIBS = {"gate_node": os.path.join(PROJ, "gate_node.pretty")}
 
 MM = pcbnew.FromMM
 
+# Extra 3D placeholders (from gen_3d.py) attached to board footprints.
+# The Heltec body rides on J1 because J1 pin 1 is its reference point.
+PLACEHOLDER_MODELS = {"J1": "Heltec_V3_placeholder.wrl"}
+
 
 def pt(x, y):
     return pcbnew.wxPointMM(x, y)
@@ -122,6 +126,11 @@ def build():
             n = netmap.get(pad.GetNumber())
             if n:
                 pad.SetNet(nets[n])
+        if ref in PLACEHOLDER_MODELS:
+            m = pcbnew.FP_3DMODEL()
+            m.m_Filename = "${KIPRJMOD}/gate_node.3dshapes/" + PLACEHOLDER_MODELS[ref]
+            m.m_Show = True
+            fp.Add3DModel(m)
         board.Add(fp)
         fps[ref] = fp
 
