@@ -34,6 +34,7 @@ static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RS
 // Mock gate configuration
 #define MOCK_GATE_ENABLED       true    // Set to false to use real sensors
 #define MOCK_TRANSITION_MS      15000   // Time to transition between states (15 seconds)
+#define MOCK_BATTERY_MV         12300   // Simulated battery voltage (12.3V)
 
 // State variables
 static uint8_t currentState = STATE_UNKNOWN;
@@ -68,6 +69,7 @@ static unsigned long lastCommandTime = 0;
 // LoRa state
 static bool lora_idle = true;
 static uint16_t pendingAckSeq = 0;
+static bool pendingStatusRequest = false;  // Flag to send status on next loop
 
 // LoRa buffers
 char txpacket[BUFFER_SIZE];
@@ -183,8 +185,17 @@ void loop() {
             Serial.printf("State changed: %s -> %s\n",
                 stateToString(lastState), stateToString(newState));
             lastState = newState;
-            sendStatus();  // Send immediately on state change
+            if (lora_idle) {
+                sendStatus();  // Send on state change when radio is idle
+            }
         }
+    }
+
+    // Handle pending status request (from CMD_STATUS)
+    if (pendingStatusRequest && lora_idle) {
+        Serial.println("Sending pending status request");
+        pendingStatusRequest = false;
+        sendStatus();
     }
 
     // Periodic heartbeat
@@ -275,6 +286,11 @@ uint8_t readGateState() {
 }
 
 uint16_t readBatteryVoltage() {
+    // Return simulated voltage in mock mode
+    if (MOCK_GATE_ENABLED) {
+        return MOCK_BATTERY_MV;
+    }
+
     const float DIVIDER_RATIO = 4.03;
     const float ADC_REF = 3300.0;
     const int ADC_MAX = 4095;
@@ -362,11 +378,14 @@ void mockGateCommand(uint8_t cmd) {
         case CMD_OPEN:
             if (currentState != STATE_OPEN) {
                 Serial.println("[MOCK] Starting OPEN transition...");
+                Serial.printf("[MOCK] Current: %s -> Target: OPEN\n", stateToString(currentState));
                 mockTargetState = STATE_OPEN;
                 mockInTransition = true;
                 mockTransitionStart = millis();
                 currentState = STATE_MOVING;
-                sendStatus();
+                // Note: Don't call sendStatus() here - let state change detection handle it
+                // to avoid TX conflict with ACK
+                Serial.println("[MOCK] State set to MOVING, will send status on next loop");
             } else {
                 Serial.println("[MOCK] Gate already OPEN");
             }
@@ -375,11 +394,14 @@ void mockGateCommand(uint8_t cmd) {
         case CMD_CLOSE:
             if (currentState != STATE_CLOSED) {
                 Serial.println("[MOCK] Starting CLOSE transition...");
+                Serial.printf("[MOCK] Current: %s -> Target: CLOSED\n", stateToString(currentState));
                 mockTargetState = STATE_CLOSED;
                 mockInTransition = true;
                 mockTransitionStart = millis();
                 currentState = STATE_MOVING;
-                sendStatus();
+                // Note: Don't call sendStatus() here - let state change detection handle it
+                // to avoid TX conflict with ACK
+                Serial.println("[MOCK] State set to MOVING, will send status on next loop");
             } else {
                 Serial.println("[MOCK] Gate already CLOSED");
             }
@@ -396,8 +418,8 @@ void mockGateCommand(uint8_t cmd) {
             break;
 
         case CMD_STATUS:
-            Serial.println("[MOCK] Status requested");
-            sendStatus();
+            Serial.println("[MOCK] Status requested - flagged for next loop");
+            pendingStatusRequest = true;
             break;
     }
 }
@@ -413,7 +435,8 @@ void updateMockGate() {
         mockInTransition = false;
 
         Serial.printf("[MOCK] Transition complete -> %s\n", stateToString(currentState));
-        sendStatus();
+        Serial.println("[MOCK] State change will be sent on next state check");
+        // Don't call sendStatus() here - let state change detection handle it
     }
 }
 

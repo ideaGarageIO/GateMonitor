@@ -47,6 +47,7 @@ STATIC_DIR = Path(__file__).parent.parent.parent / "static"
 mqtt_client: Optional[MQTTClient] = None
 connected_websockets: set[WebSocket] = set()
 last_recorded_state: Optional[str] = None
+main_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 async def broadcast_status(status: GateStatus) -> None:
@@ -58,22 +59,32 @@ async def broadcast_status(status: GateStatus) -> None:
     Args:
         status: The current gate status to broadcast.
     """
+    logger.debug("broadcast_status called, %d connected clients", len(connected_websockets))
+
     if not connected_websockets:
+        logger.debug("No connected WebSocket clients, skipping broadcast")
         return
 
     status_dict = status.to_dict()
     if mqtt_client:
         status_dict["mqtt_connected"] = mqtt_client.is_connected
+        status_dict["gateway_online"] = mqtt_client.is_gateway_online
     else:
         status_dict["mqtt_connected"] = False
+        status_dict["gateway_online"] = False
 
     message = json.dumps({"type": "status", "data": status_dict})
+    logger.info("Broadcasting status: state=%s, online=%s, gateway_online=%s to %d clients",
+                status_dict.get("state"), status_dict.get("online"),
+                status_dict.get("gateway_online"), len(connected_websockets))
 
     disconnected: set[WebSocket] = set()
     for ws in connected_websockets:
         try:
             await ws.send_text(message)
-        except Exception:
+            logger.debug("Sent status to WebSocket client")
+        except Exception as e:
+            logger.warning("Failed to send to WebSocket: %s", e)
             disconnected.add(ws)
 
     for ws in disconnected:
@@ -84,13 +95,40 @@ def on_status_update(status: GateStatus) -> None:
     """Handle MQTT status updates by scheduling an async broadcast.
 
     This callback is invoked by the MQTT client when a new status
-    message is received. It creates an asyncio task to broadcast
+    message is received. It schedules an asyncio task to broadcast
     the update to all WebSocket clients.
+
+    Note: This is called from the MQTT client's background thread,
+    so we use run_coroutine_threadsafe() to schedule on the main loop.
 
     Args:
         status: The updated gate status from MQTT.
     """
-    asyncio.create_task(broadcast_status(status))
+    logger.info("on_status_update called: state=%s, online=%s", status.state, status.online)
+    if main_event_loop is not None:
+        future = asyncio.run_coroutine_threadsafe(broadcast_status(status), main_event_loop)
+        logger.debug("Scheduled broadcast on event loop, future=%s", future)
+    else:
+        logger.warning("Event loop not available, cannot broadcast status")
+
+
+async def gateway_timeout_checker() -> None:
+    """Background task to check for gateway timeout.
+
+    Runs every 500ms to detect if the gateway has stopped sending heartbeats.
+    """
+    logger.info("Gateway timeout checker started")
+    while True:
+        await asyncio.sleep(0.5)  # Check every 500ms
+        if mqtt_client:
+            changed = mqtt_client.check_gateway_timeout()
+            if changed:
+                logger.info("Gateway timeout detected!")
+                logger.info("Status after timeout: state=%s, online=%s, gateway_online=%s",
+                           mqtt_client.status.state, mqtt_client.status.online,
+                           mqtt_client.is_gateway_online)
+                # Broadcast directly since we're already in the asyncio context
+                await broadcast_status(mqtt_client.status)
 
 
 @asynccontextmanager
@@ -106,9 +144,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     Yields:
         None during application runtime.
     """
-    global mqtt_client
+    global mqtt_client, main_event_loop
 
     logger.info("Starting Gate Monitor server")
+
+    # Store the event loop for use in MQTT callbacks (which run in a different thread)
+    main_event_loop = asyncio.get_running_loop()
 
     mqtt_client = MQTTClient(
         host=MQTT_HOST,
@@ -123,9 +164,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as e:
         logger.error("Failed to connect to MQTT: %s", e)
 
+    # Start background task to check gateway timeout
+    timeout_task = asyncio.create_task(gateway_timeout_checker())
+    logger.info("Started gateway timeout checker")
+
     yield
 
     logger.info("Shutting down Gate Monitor server")
+    timeout_task.cancel()
+    try:
+        await timeout_task
+    except asyncio.CancelledError:
+        pass
     if mqtt_client:
         mqtt_client.disconnect()
 
@@ -166,8 +216,9 @@ async def get_status() -> dict[str, Any]:
     if mqtt_client:
         status_dict = mqtt_client.status.to_dict()
         status_dict["mqtt_connected"] = mqtt_client.is_connected
+        status_dict["gateway_online"] = mqtt_client.is_gateway_online
         return status_dict
-    return {"error": "MQTT not connected", "mqtt_connected": False}
+    return {"error": "MQTT not connected", "mqtt_connected": False, "gateway_online": False}
 
 
 @app.get("/api/history")
@@ -233,6 +284,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if mqtt_client:
             status_dict = mqtt_client.status.to_dict()
             status_dict["mqtt_connected"] = mqtt_client.is_connected
+            status_dict["gateway_online"] = mqtt_client.is_gateway_online
             await websocket.send_text(
                 json.dumps({"type": "status", "data": status_dict})
             )

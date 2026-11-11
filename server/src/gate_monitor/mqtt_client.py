@@ -29,6 +29,8 @@ class MQTTClient:
         TOPIC_BATTERY: Topic for battery voltage updates.
         TOPIC_RSSI: Topic for signal strength updates.
         TOPIC_ONLINE: Topic for online/offline status.
+        TOPIC_GATEWAY_HEARTBEAT: Topic for gateway heartbeat messages.
+        GATEWAY_TIMEOUT_MS: Time in ms before gateway is considered offline.
 
     Example:
         >>> client = MQTTClient(host="192.168.1.100")
@@ -42,6 +44,8 @@ class MQTTClient:
     TOPIC_BATTERY = "gate/battery"
     TOPIC_RSSI = "gate/rssi"
     TOPIC_ONLINE = "gate/online"
+    TOPIC_GATEWAY_HEARTBEAT = "gateway/heartbeat"
+    GATEWAY_TIMEOUT_MS = 2000  # 2 seconds (4 missed heartbeats at 2Hz)
 
     def __init__(
         self,
@@ -81,6 +85,10 @@ class MQTTClient:
         self._status_callbacks: list[Callable[[GateStatus], None]] = []
         self._connected = False
 
+        # Gateway heartbeat tracking
+        self._last_gateway_heartbeat: Optional[datetime] = None
+        self._gateway_online = False
+
     @property
     def is_connected(self) -> bool:
         """Check if connected to the MQTT broker.
@@ -89,6 +97,50 @@ class MQTTClient:
             True if connected to the broker, False otherwise.
         """
         return self._connected
+
+    @property
+    def is_gateway_online(self) -> bool:
+        """Check if the gateway is online (receiving heartbeats).
+
+        Returns:
+            True if gateway heartbeat received within timeout period.
+        """
+        return self._gateway_online
+
+    def check_gateway_timeout(self) -> bool:
+        """Check if gateway has timed out and update status accordingly.
+
+        This should be called periodically to detect gateway disconnection.
+
+        Returns:
+            True if gateway status changed (went offline), False otherwise.
+        """
+        if self._last_gateway_heartbeat is None:
+            # No heartbeat ever received
+            if self._gateway_online:
+                logger.warning("Gateway timeout - never received heartbeat but was marked online")
+                self._gateway_online = False
+                self.status.state = GateState.UNKNOWN
+                self.status.online = False
+                self.status.last_update = datetime.now()
+                self._notify_callbacks()
+                return True
+            return False
+
+        elapsed = (datetime.now() - self._last_gateway_heartbeat).total_seconds() * 1000
+
+        if elapsed > self.GATEWAY_TIMEOUT_MS:
+            if self._gateway_online:
+                logger.warning("Gateway timeout - no heartbeat for %.1f seconds", elapsed / 1000)
+                self._gateway_online = False
+                # Set gate status to unknown/offline when gateway disconnects
+                self.status.state = GateState.UNKNOWN
+                self.status.online = False
+                self.status.last_update = datetime.now()
+                logger.info("Setting gate state to UNKNOWN, online=False, notifying callbacks")
+                self._notify_callbacks()
+                return True
+        return False
 
     def add_status_callback(self, callback: Callable[[GateStatus], None]) -> None:
         """Register a callback function for status updates.
@@ -168,6 +220,8 @@ class MQTTClient:
             logger.info("Connected to MQTT broker")
             self._connected = True
             client.subscribe("gate/#")
+            client.subscribe("gateway/#")
+            logger.info("Subscribed to gate/# and gateway/# topics")
         else:
             logger.error("MQTT connection failed with code %d", rc)
             self._connected = False
@@ -219,6 +273,8 @@ class MQTTClient:
                 self.status.battery_mv = int(payload)
             elif topic == self.TOPIC_RSSI:
                 self.status.rssi = int(payload)
+            elif topic == self.TOPIC_GATEWAY_HEARTBEAT:
+                self._handle_gateway_heartbeat(payload)
         except ValueError as e:
             logger.error("Error parsing MQTT message value: %s", e)
         except Exception as e:
@@ -279,12 +335,46 @@ class MQTTClient:
         self.status.last_update = datetime.now()
         self._notify_callbacks()
 
+    def _handle_gateway_heartbeat(self, payload: str) -> None:
+        """Handle a gateway heartbeat message.
+
+        Updates the last heartbeat timestamp and gateway online status.
+
+        Args:
+            payload: JSON string containing gateway status data.
+        """
+        try:
+            data = json.loads(payload)
+            self._last_gateway_heartbeat = datetime.now()
+
+            # If gateway was offline, mark it as online and notify
+            if not self._gateway_online:
+                logger.info("Gateway came online - received first heartbeat")
+                self._gateway_online = True
+                # Notify callbacks to update UI with gateway online status
+                self._notify_callbacks()
+
+            # Log every 10th heartbeat or so to avoid spam (roughly every 5 seconds)
+            if hasattr(self, '_heartbeat_count'):
+                self._heartbeat_count += 1
+            else:
+                self._heartbeat_count = 1
+
+            if self._heartbeat_count % 10 == 1:
+                logger.debug("Gateway heartbeat #%d: gate_online=%s, uptime=%s",
+                            self._heartbeat_count, data.get("gate_online"), data.get("uptime"))
+
+        except json.JSONDecodeError as e:
+            logger.error("Invalid JSON in gateway heartbeat: %s", e)
+
     def _notify_callbacks(self) -> None:
         """Notify all registered callbacks of a status update.
 
         Catches and logs any exceptions raised by callbacks to prevent
         one failing callback from affecting others.
         """
+        logger.info("Notifying %d callbacks of status update: state=%s",
+                    len(self._status_callbacks), self.status.state)
         for callback in self._status_callbacks:
             try:
                 callback(self.status)

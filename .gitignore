@@ -80,3 +80,10 @@ logs/
 secrets/
 *.pem
 *.key
+
+# KiCad local/user state
+*.kicad_prl
+*-backups/
+fp-info-cache
+_autosave-*
+*.lck

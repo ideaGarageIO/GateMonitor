@@ -33,6 +33,11 @@ const char* TOPIC_COMMAND = "gate/command";
 const char* TOPIC_BATTERY = "gate/battery";
 const char* TOPIC_RSSI = "gate/rssi";
 const char* TOPIC_ONLINE = "gate/online";
+const char* TOPIC_GATEWAY_HEARTBEAT = "gateway/heartbeat";
+
+// Gateway heartbeat to server (2Hz = 500ms)
+#define GATEWAY_HEARTBEAT_INTERVAL_MS  500
+static unsigned long lastGatewayHeartbeat = 0;
 
 // WiFi and MQTT clients
 WiFiClient wifiClient;
@@ -46,6 +51,14 @@ static int8_t lastSnr = 0;
 static uint16_t commandSeq = 0;
 static unsigned long lastGateMessage = 0;
 static bool gateOnline = false;
+
+// Display power saving
+#define DISPLAY_TIMEOUT_MS      60000   // Turn off display after 60 seconds of stable connection
+#define DISPLAY_ERROR_DURATION  5000    // Show error for 5 seconds before turning off again
+static bool displayEnabled = true;
+static unsigned long displayOnTime = 0;         // When display was turned on
+static unsigned long lastConnectionOk = 0;      // Last time all connections were good
+static bool wasConnected = false;               // Track previous connection state for edge detection
 
 // LoRa buffers
 char txpacket[BUFFER_SIZE];
@@ -71,6 +84,10 @@ void reconnectMQTT();
 void sendCommand(uint8_t cmd);
 void publishStatus();
 void updateDisplay();
+void updateDisplayTimeout();
+void turnOffDisplay();
+void turnOnDisplay();
+void showConnectionError(const char* error);
 void OnTxDone();
 void OnTxTimeout();
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr);
@@ -99,27 +116,55 @@ void setup() {
     initWiFi();
     initMQTT();
 
+    // Initialize display timeout tracking
+    displayOnTime = millis();
+    displayEnabled = true;
+
     Serial.println("House Gateway Ready");
+    Serial.printf("Display will turn off after %d seconds if all connections OK\n", DISPLAY_TIMEOUT_MS / 1000);
 }
 
 void loop() {
     unsigned long now = millis();
 
+    // Check connection status for display management
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+    bool mqttOk = mqtt.connected();
+    bool gateOk = gateOnline;
+    bool allConnected = wifiOk && mqttOk && gateOk;
+
     // Maintain WiFi connection
-    if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiOk) {
         Serial.println("WiFi disconnected, reconnecting...");
+        showConnectionError("WiFi Lost!");
         initWiFi();
     }
 
     // Maintain MQTT connection
-    if (!mqtt.connected()) {
+    if (!mqttOk) {
+        if (wifiOk) {  // Only show MQTT error if WiFi is OK
+            showConnectionError("MQTT Lost!");
+        }
         reconnectMQTT();
     }
     mqtt.loop();
 
+    // Send gateway heartbeat to server (2Hz)
+    if (mqtt.connected() && (now - lastGatewayHeartbeat >= GATEWAY_HEARTBEAT_INTERVAL_MS)) {
+        lastGatewayHeartbeat = now;
+        // Send JSON heartbeat with gateway status
+        char heartbeat[128];
+        sprintf(heartbeat, "{\"gate_online\":%s,\"wifi_rssi\":%d,\"uptime\":%lu}",
+            gateOnline ? "true" : "false",
+            WiFi.RSSI(),
+            now / 1000);
+        mqtt.publish(TOPIC_GATEWAY_HEARTBEAT, heartbeat);
+    }
+
     // Check gate online status (offline if no message for 2x heartbeat interval)
     if (gateOnline && (now - lastGateMessage > HEARTBEAT_INTERVAL * 2)) {
         gateOnline = false;
+        gateOk = false;
         gateState = STATE_UNKNOWN;
         mqtt.publish(TOPIC_ONLINE, "offline", true);
 
@@ -130,7 +175,21 @@ void loop() {
         mqtt.publish(TOPIC_STATUS, json, true);
 
         Serial.println("Gate went offline - state set to UNKNOWN");
+        showConnectionError("Gate Offline!");
     }
+
+    // Update connection tracking for display timeout
+    allConnected = wifiOk && mqttOk && gateOk;
+    if (allConnected) {
+        lastConnectionOk = now;
+    }
+
+    // Detect connection recovery - turn on display briefly to show status
+    if (allConnected && !wasConnected) {
+        Serial.println("All connections restored");
+        turnOnDisplay();
+    }
+    wasConnected = allConnected;
 
     // Command retry
     if (pendingCmdSeq > 0 && (now - pendingCmdTime >= ACK_TIMEOUT)) {
@@ -150,8 +209,13 @@ void loop() {
         }
     }
 
-    // Update display
-    updateDisplay();
+    // Handle display timeout
+    updateDisplayTimeout();
+
+    // Update display (only if enabled)
+    if (displayEnabled) {
+        updateDisplay();
+    }
 
     // Process radio events
     Radio.IrqProcess();
@@ -364,6 +428,93 @@ void updateDisplay() {
     }
 
     display.display();
+}
+
+void updateDisplayTimeout() {
+    unsigned long now = millis();
+
+    // Check if all connections are good
+    bool wifiOk = (WiFi.status() == WL_CONNECTED);
+    bool mqttOk = mqtt.connected();
+    bool gateOk = gateOnline;
+    bool allConnected = wifiOk && mqttOk && gateOk;
+
+    // If not all connected, keep display on
+    if (!allConnected) {
+        if (!displayEnabled) {
+            turnOnDisplay();
+        }
+        return;
+    }
+
+    // All connections good - check if we should turn off display
+    if (displayEnabled) {
+        unsigned long displayOnDuration = now - displayOnTime;
+        if (displayOnDuration >= DISPLAY_TIMEOUT_MS) {
+            Serial.println("Display timeout - all connections OK, turning off display");
+            turnOffDisplay();
+        }
+    }
+}
+
+void turnOffDisplay() {
+    if (!displayEnabled) return;
+
+    Serial.println("Turning off display to save power");
+
+    // Show brief message before turning off
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 20, "Display OFF");
+    display.drawString(0, 32, "All systems OK");
+    display.drawString(0, 44, "Listening...");
+    display.display();
+    delay(1000);
+
+    display.displayOff();
+    VextOFF();
+    displayEnabled = false;
+
+    Serial.println("Display disabled");
+}
+
+void turnOnDisplay() {
+    if (displayEnabled) {
+        // Just reset the timeout
+        displayOnTime = millis();
+        return;
+    }
+
+    Serial.println("Turning on display");
+
+    VextON();
+    delay(50);
+
+    display.displayOn();
+    display.init();
+    display.clear();
+    display.setContrast(255);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    displayEnabled = true;
+    displayOnTime = millis();
+
+    Serial.println("Display enabled");
+}
+
+void showConnectionError(const char* error) {
+    // Turn on display to show error
+    turnOnDisplay();
+
+    // Show error message prominently
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, "CONNECTION");
+    display.drawString(0, 18, "ERROR");
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 40, error);
+    display.display();
+
+    Serial.printf("Connection error displayed: %s\n", error);
 }
 
 // LoRa Callbacks
