@@ -3,7 +3,9 @@
  * Heltec WiFi LoRa 32 V3
  *
  * Monitors gate limit switches and controls gate via optocouplers.
- * Communicates with house gateway over LoRa.
+ * Radio always listening for commands from gateway.
+ * Sends heartbeat every 10 seconds.
+ * Display turns off after 30s boot period + confirmed connection.
  */
 
 #include "LoRaWan_APP.h"
@@ -22,27 +24,57 @@ static SSD1306Wire display(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RS
 #define PIN_CTRL_CLOSE    8     // Optocoupler: close command
 #define PIN_BATTERY_ADC   1     // Battery voltage divider
 
-// Control timing
-#define CONTROL_PULSE_MS  500   // Pulse duration for gate command
+// Timing Configuration
+#define HEARTBEAT_INTERVAL_MS   10000   // Heartbeat every 10 seconds
+#define DISPLAY_TIMEOUT_MS      30000   // Display on for 30 seconds at boot
+#define CONTROL_PULSE_MS        500     // Pulse duration for gate command
+#define STATE_CHECK_INTERVAL_MS 1000    // Check gate state every 1 second
+#define REQUIRED_ACKS           3       // ACKs needed to confirm connection
+
+// Mock gate configuration
+#define MOCK_GATE_ENABLED       true    // Set to false to use real sensors
+#define MOCK_TRANSITION_MS      15000   // Time to transition between states (15 seconds)
+#define MOCK_BATTERY_MV         12300   // Simulated battery voltage (12.3V)
 
 // State variables
 static uint8_t currentState = STATE_UNKNOWN;
 static uint8_t lastState = STATE_UNKNOWN;
 static uint16_t batteryMv = 0;
 static uint16_t sequenceNum = 0;
+
+// Mock gate state machine
+static uint8_t mockTargetState = STATE_CLOSED;  // Where gate is heading
+static unsigned long mockTransitionStart = 0;   // When transition started
+static bool mockInTransition = false;           // Currently moving?
+
+// Timing
 static unsigned long lastHeartbeat = 0;
-static unsigned long lastStateChange = 0;
+static unsigned long lastStateCheck = 0;
+static unsigned long bootTime = 0;
+
+// Connection tracking
+static uint8_t ackCount = 0;
+static bool connectionConfirmed = false;
+static unsigned long lastAckTime = 0;
+
+// Display state
+static bool displayEnabled = true;
+static bool displayCanTurnOff = false;
+
+// Command display state
+static const char* lastCommand = nullptr;
+static unsigned long lastCommandTime = 0;
+#define COMMAND_DISPLAY_DURATION_MS  5000  // Show command for 5 seconds
+
+// LoRa state
+static bool lora_idle = true;
+static uint16_t pendingAckSeq = 0;
+static bool pendingStatusRequest = false;  // Flag to send status on next loop
 
 // LoRa buffers
 char txpacket[BUFFER_SIZE];
 char rxpacket[BUFFER_SIZE];
 static RadioEvents_t RadioEvents;
-bool lora_idle = true;
-
-// Pending ACK tracking
-static uint16_t pendingAckSeq = 0;
-static unsigned long pendingAckTime = 0;
-static uint8_t retryCount = 0;
 
 // Function declarations
 void VextON();
@@ -52,11 +84,17 @@ void initLoRa();
 void initGPIO();
 uint8_t readGateState();
 uint16_t readBatteryVoltage();
-void sendStatus();
 void sendHeartbeat();
+void sendStatus();
 void processCommand(uint8_t cmd);
 void pulseOutput(uint8_t pin);
 void updateDisplay();
+void checkDisplayTimeout();
+void turnOffDisplay();
+void turnOnDisplay();
+void showCommandReceived(const char* cmdName);
+void mockGateCommand(uint8_t cmd);
+void updateMockGate();
 void OnTxDone();
 void OnTxTimeout();
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr);
@@ -73,77 +111,110 @@ void VextOFF() {
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
+    delay(500);
 
-    Serial.println("=== Gate Node Starting ===");
+    Serial.println("\n=============================");
+    Serial.println("   GATE NODE - Starting Up");
+    Serial.println("=============================");
 
+    bootTime = millis();
+
+    // Initialize hardware
     VextON();
     delay(100);
 
     initDisplay();
     initGPIO();
+
+    // Show boot message
+    display.clear();
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, "GATE NODE");
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 20, "Initializing...");
+    display.display();
+
     initLoRa();
 
     // Read initial state
-    currentState = readGateState();
+    if (MOCK_GATE_ENABLED) {
+        // Mock mode: start as CLOSED
+        currentState = STATE_CLOSED;
+        mockTargetState = STATE_CLOSED;
+        mockInTransition = false;
+        Serial.println("*** MOCK GATE MODE ENABLED ***");
+    } else {
+        currentState = readGateState();
+    }
     lastState = currentState;
     batteryMv = readBatteryVoltage();
+
+    Serial.printf("Initial State: %s\n", stateToString(currentState));
+    Serial.printf("Battery: %u mV (%.2fV)\n", batteryMv, batteryMv / 1000.0);
 
     // Send initial status
     sendStatus();
 
-    Serial.println("Gate Node Ready");
-    Serial.printf("Initial State: %s\n", stateToString(currentState));
-    Serial.printf("Battery: %u mV\n", batteryMv);
+    Serial.println("Gate Node Ready - Listening for commands");
+    Serial.println("Display will turn off after 30s + connection confirmed");
 }
 
 void loop() {
     unsigned long now = millis();
 
-    // Read current gate state
-    currentState = readGateState();
+    // Process radio events (always - for receiving commands)
+    Radio.IrqProcess();
 
-    // State change detection
-    if (currentState != lastState) {
-        if (now - lastStateChange > DEBOUNCE_TIME) {
+    // Update mock gate state machine (if enabled)
+    if (MOCK_GATE_ENABLED) {
+        updateMockGate();
+    }
+
+    // Periodic state check
+    if (now - lastStateCheck >= STATE_CHECK_INTERVAL_MS) {
+        lastStateCheck = now;
+
+        uint8_t newState;
+        if (MOCK_GATE_ENABLED) {
+            newState = currentState;  // Mock state is updated by updateMockGate()
+        } else {
+            newState = readGateState();
+        }
+
+        if (newState != lastState) {
             Serial.printf("State changed: %s -> %s\n",
-                stateToString(lastState), stateToString(currentState));
-            lastState = currentState;
-            lastStateChange = now;
-            sendStatus();
+                stateToString(lastState), stateToString(newState));
+            lastState = newState;
+            if (lora_idle) {
+                sendStatus();  // Send on state change when radio is idle
+            }
         }
     }
 
+    // Handle pending status request (from CMD_STATUS)
+    if (pendingStatusRequest && lora_idle) {
+        Serial.println("Sending pending status request");
+        pendingStatusRequest = false;
+        sendStatus();
+    }
+
     // Periodic heartbeat
-    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
         batteryMv = readBatteryVoltage();
         sendHeartbeat();
         lastHeartbeat = now;
     }
 
-    // ACK timeout / retry
-    if (pendingAckSeq > 0 && (now - pendingAckTime >= ACK_TIMEOUT)) {
-        if (retryCount < RETRY_COUNT) {
-            Serial.printf("ACK timeout, retry %d\n", retryCount + 1);
-            // Resend last message
-            if (lora_idle) {
-                Radio.Send((uint8_t *)txpacket, strlen(txpacket));
-                lora_idle = false;
-                pendingAckTime = now;
-                retryCount++;
-            }
-        } else {
-            Serial.println("ACK failed after retries");
-            pendingAckSeq = 0;
-            retryCount = 0;
-        }
+    // Check if display should turn off
+    checkDisplayTimeout();
+
+    // Update display if enabled
+    if (displayEnabled) {
+        updateDisplay();
     }
 
-    // Update display
-    updateDisplay();
-
-    // Process radio events
-    Radio.IrqProcess();
+    // Small delay to reduce CPU usage
+    delay(10);
 }
 
 void initDisplay() {
@@ -151,10 +222,8 @@ void initDisplay() {
     display.clear();
     display.setContrast(255);
     display.setTextAlignment(TEXT_ALIGN_LEFT);
-    display.setFont(ArialMT_Plain_10);
-    display.drawString(0, 0, "Gate Node");
-    display.drawString(0, 12, "Initializing...");
-    display.display();
+    displayEnabled = true;
+    Serial.println("Display initialized");
 }
 
 void initLoRa() {
@@ -180,8 +249,11 @@ void initLoRa() {
         0, true, 0, 0, LORA_IQ_INVERSION_ON, true
     );
 
+    // Start in continuous RX mode - always listening
     Radio.Rx(0);
-    Serial.println("LoRa initialized");
+    lora_idle = true;
+
+    Serial.println("LoRa initialized - Continuous RX mode");
 }
 
 void initGPIO() {
@@ -209,79 +281,89 @@ uint8_t readGateState() {
     } else if (!openSwitch && !closedSwitch) {
         return STATE_MOVING;
     } else {
-        // Both switches active = error condition
         return STATE_ERROR;
     }
 }
 
 uint16_t readBatteryVoltage() {
-    // Read ADC and convert to millivolts
-    // Assuming voltage divider: 12V -> 3.3V range
-    // Divider ratio depends on resistor values
-    // Example: 10k/3.3k divider = 4.03 ratio
-    const float DIVIDER_RATIO = 4.03;
-    const float ADC_REF = 3300.0;  // 3.3V reference in mV
-    const int ADC_MAX = 4095;       // 12-bit ADC
-
-    int adcValue = analogRead(PIN_BATTERY_ADC);
-    float voltage = (adcValue * ADC_REF / ADC_MAX) * DIVIDER_RATIO;
-
-    return (uint16_t)voltage;
-}
-
-void sendStatus() {
-    sequenceNum++;
-    formatStatusMessage(txpacket, currentState, batteryMv, sequenceNum);
-
-    Serial.printf("TX Status: %s\n", txpacket);
-
-    if (lora_idle) {
-        lora_idle = false;
-        pendingAckSeq = sequenceNum;
-        pendingAckTime = millis();
-        retryCount = 0;
-        Radio.Send((uint8_t *)txpacket, strlen(txpacket));
+    // Return simulated voltage in mock mode
+    if (MOCK_GATE_ENABLED) {
+        return MOCK_BATTERY_MV;
     }
+
+    const float DIVIDER_RATIO = 4.03;
+    const float ADC_REF = 3300.0;
+    const int ADC_MAX = 4095;
+
+    // Average multiple readings
+    int total = 0;
+    for (int i = 0; i < 4; i++) {
+        total += analogRead(PIN_BATTERY_ADC);
+        delay(2);
+    }
+    int adcValue = total / 4;
+
+    float voltage = (adcValue * ADC_REF / ADC_MAX) * DIVIDER_RATIO;
+    return (uint16_t)voltage;
 }
 
 void sendHeartbeat() {
     sequenceNum++;
     formatHeartbeatMessage(txpacket, currentState, batteryMv, sequenceNum);
 
-    Serial.printf("TX Heartbeat: %s\n", txpacket);
+    Serial.printf("TX Heartbeat [%u]: %s\n", sequenceNum, txpacket);
 
-    if (lora_idle) {
-        lora_idle = false;
-        pendingAckSeq = sequenceNum;
-        pendingAckTime = millis();
-        retryCount = 0;
-        Radio.Send((uint8_t *)txpacket, strlen(txpacket));
-    }
+    pendingAckSeq = sequenceNum;
+    lora_idle = false;
+    Radio.Send((uint8_t *)txpacket, strlen(txpacket));
+}
+
+void sendStatus() {
+    sequenceNum++;
+    formatStatusMessage(txpacket, currentState, batteryMv, sequenceNum);
+
+    Serial.printf("TX Status [%u]: %s\n", sequenceNum, txpacket);
+
+    pendingAckSeq = sequenceNum;
+    lora_idle = false;
+    Radio.Send((uint8_t *)txpacket, strlen(txpacket));
 }
 
 void processCommand(uint8_t cmd) {
-    Serial.printf("Processing command: %s\n", commandToString(cmd));
+    const char* cmdName = commandToString(cmd);
+    Serial.printf("Executing command: %s\n", cmdName);
 
-    // Safety check: don't open if battery critically low
+    // Show command on display for debugging
+    showCommandReceived(cmdName);
+
+    // Safety: don't open if battery critically low
     if (cmd == CMD_OPEN && batteryMv < BATTERY_CRITICAL) {
-        Serial.println("Battery critical - OPEN command blocked");
+        Serial.println("BLOCKED: Battery critical - cannot open gate");
         return;
     }
 
-    switch (cmd) {
-        case CMD_OPEN:
-            pulseOutput(PIN_CTRL_OPEN);
-            break;
-        case CMD_CLOSE:
-            pulseOutput(PIN_CTRL_CLOSE);
-            break;
-        case CMD_STOP:
-            // Pulse either to stop (depends on controller)
-            pulseOutput(PIN_CTRL_OPEN);
-            break;
-        case CMD_STATUS:
-            sendStatus();
-            break;
+    // Use mock or real gate control
+    if (MOCK_GATE_ENABLED) {
+        mockGateCommand(cmd);
+    } else {
+        switch (cmd) {
+            case CMD_OPEN:
+                Serial.println("Opening gate...");
+                pulseOutput(PIN_CTRL_OPEN);
+                break;
+            case CMD_CLOSE:
+                Serial.println("Closing gate...");
+                pulseOutput(PIN_CTRL_CLOSE);
+                break;
+            case CMD_STOP:
+                Serial.println("Stopping gate...");
+                pulseOutput(PIN_CTRL_OPEN);  // Most controllers: any pulse = stop if moving
+                break;
+            case CMD_STATUS:
+                Serial.println("Status requested");
+                sendStatus();
+                break;
+        }
     }
 }
 
@@ -291,37 +373,251 @@ void pulseOutput(uint8_t pin) {
     digitalWrite(pin, LOW);
 }
 
-void updateDisplay() {
-    display.clear();
-    display.setFont(ArialMT_Plain_10);
+void mockGateCommand(uint8_t cmd) {
+    switch (cmd) {
+        case CMD_OPEN:
+            if (currentState != STATE_OPEN) {
+                Serial.println("[MOCK] Starting OPEN transition...");
+                Serial.printf("[MOCK] Current: %s -> Target: OPEN\n", stateToString(currentState));
+                mockTargetState = STATE_OPEN;
+                mockInTransition = true;
+                mockTransitionStart = millis();
+                currentState = STATE_MOVING;
+                // Note: Don't call sendStatus() here - let state change detection handle it
+                // to avoid TX conflict with ACK
+                Serial.println("[MOCK] State set to MOVING, will send status on next loop");
+            } else {
+                Serial.println("[MOCK] Gate already OPEN");
+            }
+            break;
 
-    // Header
-    display.drawString(0, 0, "GATE NODE");
-    display.drawLine(0, 11, 128, 11);
+        case CMD_CLOSE:
+            if (currentState != STATE_CLOSED) {
+                Serial.println("[MOCK] Starting CLOSE transition...");
+                Serial.printf("[MOCK] Current: %s -> Target: CLOSED\n", stateToString(currentState));
+                mockTargetState = STATE_CLOSED;
+                mockInTransition = true;
+                mockTransitionStart = millis();
+                currentState = STATE_MOVING;
+                // Note: Don't call sendStatus() here - let state change detection handle it
+                // to avoid TX conflict with ACK
+                Serial.println("[MOCK] State set to MOVING, will send status on next loop");
+            } else {
+                Serial.println("[MOCK] Gate already CLOSED");
+            }
+            break;
 
-    // State
-    display.drawString(0, 14, "State: " + String(stateToString(currentState)));
+        case CMD_STOP:
+            if (mockInTransition) {
+                Serial.println("[MOCK] STOP - halting in MOVING state");
+                mockInTransition = false;
+                // Stay in MOVING state (simulates gate stopped mid-travel)
+            } else {
+                Serial.println("[MOCK] Gate not moving, STOP ignored");
+            }
+            break;
 
-    // Battery
-    char battStr[20];
-    sprintf(battStr, "Batt: %.2fV", batteryMv / 1000.0);
-    display.drawString(0, 26, battStr);
+        case CMD_STATUS:
+            Serial.println("[MOCK] Status requested - flagged for next loop");
+            pendingStatusRequest = true;
+            break;
+    }
+}
 
-    // Battery status indicator
-    if (batteryMv < BATTERY_CRITICAL) {
-        display.drawString(80, 26, "CRIT!");
-    } else if (batteryMv < BATTERY_LOW) {
-        display.drawString(80, 26, "LOW");
+void updateMockGate() {
+    if (!mockInTransition) return;
+
+    unsigned long elapsed = millis() - mockTransitionStart;
+
+    if (elapsed >= MOCK_TRANSITION_MS) {
+        // Transition complete
+        currentState = mockTargetState;
+        mockInTransition = false;
+
+        Serial.printf("[MOCK] Transition complete -> %s\n", stateToString(currentState));
+        Serial.println("[MOCK] State change will be sent on next state check");
+        // Don't call sendStatus() here - let state change detection handle it
+    }
+}
+
+void checkDisplayTimeout() {
+    if (!displayEnabled) return;
+
+    unsigned long now = millis();
+    unsigned long uptime = now - bootTime;
+    bool timeoutReached = (uptime >= DISPLAY_TIMEOUT_MS);
+
+    // If showing a command, wait for command display duration
+    if (lastCommand != nullptr) {
+        if (now - lastCommandTime >= COMMAND_DISPLAY_DURATION_MS) {
+            Serial.println("Command display duration ended");
+            lastCommand = nullptr;
+            // Re-enable display timeout after command shown
+            if (connectionConfirmed && timeoutReached) {
+                displayCanTurnOff = true;
+            }
+        }
+        return;  // Don't turn off while showing command
     }
 
-    // Sequence
-    display.drawString(0, 38, "Seq: " + String(sequenceNum));
+    // Can turn off if: 30 seconds passed AND connection confirmed
+    if (timeoutReached && connectionConfirmed && !displayCanTurnOff) {
+        displayCanTurnOff = true;
+        Serial.println("Display timeout reached and connection confirmed");
+        Serial.printf("  - Uptime: %lu ms\n", uptime);
+        Serial.printf("  - ACKs received: %d\n", ackCount);
+    }
 
-    // Pending ACK
-    if (pendingAckSeq > 0) {
-        display.drawString(0, 50, "Waiting ACK...");
+    if (displayCanTurnOff) {
+        turnOffDisplay();
+    }
+}
+
+void turnOffDisplay() {
+    if (!displayEnabled) return;
+
+    Serial.println("Turning off display to save power");
+
+    display.clear();
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 24, "Display OFF");
+    display.drawString(0, 36, "Radio listening...");
+    display.display();
+    delay(1000);
+
+    display.displayOff();
+    VextOFF();
+    displayEnabled = false;
+
+    Serial.println("Display disabled - power saving mode active");
+}
+
+void turnOnDisplay() {
+    if (displayEnabled) return;
+
+    Serial.println("Turning on display for command feedback");
+
+    VextON();
+    delay(50);
+
+    display.displayOn();
+    display.init();
+    display.clear();
+    display.setContrast(255);
+    display.setTextAlignment(TEXT_ALIGN_LEFT);
+    displayEnabled = true;
+
+    // Reset the timeout - allow display to turn off after command is processed
+    displayCanTurnOff = false;
+}
+
+void showCommandReceived(const char* cmdName) {
+    // Turn on display if it was off
+    turnOnDisplay();
+
+    // Store command for display
+    lastCommand = cmdName;
+    lastCommandTime = millis();
+
+    // Show command immediately
+    display.clear();
+
+    display.setFont(ArialMT_Plain_16);
+    display.drawString(0, 0, "COMMAND RX");
+
+    display.setFont(ArialMT_Plain_24);
+    display.drawStringMaxWidth(0, 22, 128, cmdName);
+
+    display.setFont(ArialMT_Plain_10);
+    display.drawString(0, 54, "Processing...");
+
+    display.display();
+
+    Serial.printf("Display showing command: %s\n", cmdName);
+}
+
+void updateDisplay() {
+    static unsigned long lastDisplayUpdate = 0;
+
+    // Update display every 250ms to avoid flicker
+    if (millis() - lastDisplayUpdate < 250) return;
+    lastDisplayUpdate = millis();
+
+    // If showing a command, display command screen instead of normal status
+    if (lastCommand != nullptr) {
+        display.clear();
+
+        display.setFont(ArialMT_Plain_16);
+        display.drawString(0, 0, "COMMAND RX");
+
+        display.setFont(ArialMT_Plain_24);
+        display.drawStringMaxWidth(0, 22, 128, lastCommand);
+
+        // Show remaining time
+        unsigned long elapsed = millis() - lastCommandTime;
+        int remaining = (COMMAND_DISPLAY_DURATION_MS - elapsed) / 1000;
+        display.setFont(ArialMT_Plain_10);
+        char buf[32];
+        sprintf(buf, "Executed (%ds)", remaining > 0 ? remaining : 0);
+        display.drawString(0, 54, buf);
+
+        display.display();
+        return;
+    }
+
+    display.clear();
+
+    // Header
+    display.setFont(ArialMT_Plain_16);
+    if (MOCK_GATE_ENABLED) {
+        display.drawString(0, 0, "GATE [MOCK]");
     } else {
-        display.drawString(0, 50, "Idle");
+        display.drawString(0, 0, "GATE NODE");
+    }
+
+    display.setFont(ArialMT_Plain_10);
+
+    // Gate State with mock transition info
+    String stateStr = "State: ";
+    stateStr += stateToString(currentState);
+    if (MOCK_GATE_ENABLED && mockInTransition) {
+        unsigned long elapsed = millis() - mockTransitionStart;
+        int remaining = (MOCK_TRANSITION_MS - elapsed) / 1000;
+        stateStr += " (" + String(remaining) + "s)";
+    }
+    display.drawString(0, 18, stateStr);
+
+    // Battery voltage with status
+    char battStr[32];
+    sprintf(battStr, "Battery: %.2fV", batteryMv / 1000.0);
+    display.drawString(0, 30, battStr);
+
+    // Battery warning
+    if (batteryMv < BATTERY_CRITICAL) {
+        display.drawString(90, 30, "CRIT!");
+    } else if (batteryMv < BATTERY_LOW) {
+        display.drawString(90, 30, "LOW");
+    }
+
+    // Connection status
+    String connStr = "Link: ";
+    if (connectionConfirmed) {
+        connStr += "OK (" + String(ackCount) + " ACKs)";
+    } else {
+        connStr += "Waiting... (" + String(ackCount) + "/" + String(REQUIRED_ACKS) + ")";
+    }
+    display.drawString(0, 42, connStr);
+
+    // Countdown to display off
+    unsigned long uptime = millis() - bootTime;
+    if (uptime < DISPLAY_TIMEOUT_MS) {
+        int remaining = (DISPLAY_TIMEOUT_MS - uptime) / 1000;
+        String countStr = "Display off in: " + String(remaining) + "s";
+        display.drawString(0, 54, countStr);
+    } else if (!connectionConfirmed) {
+        display.drawString(0, 54, "Waiting for connection...");
+    } else {
+        display.drawString(0, 54, "Ready to sleep");
     }
 
     display.display();
@@ -329,50 +625,59 @@ void updateDisplay() {
 
 // LoRa Callbacks
 void OnTxDone() {
-    Serial.println("TX Done");
+    Serial.println("TX Complete");
     lora_idle = true;
-    Radio.Rx(0);
+    Radio.Rx(0);  // Return to RX mode immediately
 }
 
 void OnTxTimeout() {
-    Serial.println("TX Timeout");
+    Serial.println("TX Timeout!");
     lora_idle = true;
-    Radio.Rx(0);
+    Radio.Rx(0);  // Return to RX mode
 }
 
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
     memcpy(rxpacket, payload, size);
     rxpacket[size] = '\0';
 
-    Serial.printf("RX: %s (RSSI: %d, SNR: %d)\n", rxpacket, rssi, snr);
+    Serial.printf("RX [RSSI:%d SNR:%d]: %s\n", rssi, snr, rxpacket);
 
-    // Parse message
     char msgType = rxpacket[0];
 
     if (msgType == MSG_ACK) {
-        // Parse ACK sequence
+        // ACK received
         uint16_t ackSeq = 0;
         if (sscanf(rxpacket, "A|%hu", &ackSeq) == 1) {
+            Serial.printf("ACK for seq %u (expected %u)\n", ackSeq, pendingAckSeq);
+
             if (ackSeq == pendingAckSeq) {
-                Serial.println("ACK received");
+                ackCount++;
+                lastAckTime = millis();
                 pendingAckSeq = 0;
-                retryCount = 0;
+
+                Serial.printf("ACK confirmed! Total ACKs: %d\n", ackCount);
+
+                // Check if connection is now confirmed
+                if (!connectionConfirmed && ackCount >= REQUIRED_ACKS) {
+                    connectionConfirmed = true;
+                    Serial.println("*** CONNECTION CONFIRMED ***");
+                }
             }
         }
     } else if (msgType == MSG_COMMAND) {
-        // Parse command
+        // Command received
         uint8_t cmd = 0;
         uint16_t seq = 0;
         if (sscanf(rxpacket, "C|%hhu|%hu", &cmd, &seq) == 2) {
-            // Send ACK
+            Serial.printf("Command received: %s (seq %u)\n", commandToString(cmd), seq);
+
+            // Send ACK first
             char ackBuf[16];
             formatAckMessage(ackBuf, seq);
-            if (lora_idle) {
-                lora_idle = false;
-                Radio.Send((uint8_t *)ackBuf, strlen(ackBuf));
-            }
+            Serial.printf("TX ACK: %s\n", ackBuf);
+            Radio.Send((uint8_t *)ackBuf, strlen(ackBuf));
 
-            // Process command
+            // Process the command after ACK is queued
             processCommand(cmd);
         }
     }

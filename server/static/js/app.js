@@ -11,7 +11,9 @@ const RECONNECT_DELAY = 3000;
 
 // DOM Elements
 const elements = {
-    connectionStatus: document.getElementById('connection-status'),
+    wsStatus: document.getElementById('ws-status'),
+    mqttStatus: document.getElementById('mqtt-status'),
+    gatewayStatus: document.getElementById('gateway-status'),
     gateState: document.getElementById('gate-state'),
     gateOnline: document.getElementById('gate-online'),
     batteryValue: document.getElementById('battery-value'),
@@ -98,6 +100,15 @@ function handleMessage(message) {
  * Update the UI with new status data
  */
 function updateStatus(data) {
+    // MQTT connection status
+    if (data.mqtt_connected !== undefined) {
+        updateMqttStatus(data.mqtt_connected);
+    }
+
+    // Gateway connection status
+    const gatewayOnline = data.gateway_online !== undefined ? data.gateway_online : false;
+    updateGatewayStatus(gatewayOnline);
+
     // Gate state
     const state = data.state.toLowerCase();
     elements.gateState.className = `gate-state ${state}`;
@@ -108,22 +119,31 @@ function updateStatus(data) {
     elements.gateOnline.querySelector('.online-text').textContent =
         data.online ? 'Online' : 'Offline';
 
-    // Battery
-    elements.batteryValue.textContent = `${data.battery_v}V`;
-    const batteryPercent = calculateBatteryPercent(data.battery_mv);
-    elements.batteryLevel.style.width = `${batteryPercent}%`;
-    elements.batteryLevel.className = 'battery-level';
-    if (batteryPercent < 20) {
-        elements.batteryLevel.classList.add('critical');
-    } else if (batteryPercent < 40) {
-        elements.batteryLevel.classList.add('low');
+    // When gateway is offline, show placeholder values for telemetry
+    if (!gatewayOnline) {
+        elements.batteryValue.textContent = '--';
+        elements.batteryLevel.style.width = '0%';
+        elements.batteryLevel.className = 'battery-level';
+        elements.rssiValue.textContent = '--';
+        elements.snrValue.textContent = '--';
+    } else {
+        // Battery
+        elements.batteryValue.textContent = `${data.battery_v}V`;
+        const batteryPercent = calculateBatteryPercent(data.battery_mv);
+        elements.batteryLevel.style.width = `${batteryPercent}%`;
+        elements.batteryLevel.className = 'battery-level';
+        if (batteryPercent < 20) {
+            elements.batteryLevel.classList.add('critical');
+        } else if (batteryPercent < 40) {
+            elements.batteryLevel.classList.add('low');
+        }
+
+        // Signal
+        elements.rssiValue.textContent = `${data.rssi} dBm`;
+        elements.snrValue.textContent = `${data.snr} dB`;
     }
 
-    // Signal
-    elements.rssiValue.textContent = `${data.rssi} dBm`;
-    elements.snrValue.textContent = `${data.snr} dB`;
-
-    // Last update
+    // Last update - always show when we last heard from the system
     if (data.last_update) {
         const date = new Date(data.last_update);
         elements.lastUpdate.textContent = formatTime(date);
@@ -170,13 +190,31 @@ function formatTime(date) {
 }
 
 /**
- * Update connection status indicator
+ * Update WebSocket connection status indicator
  */
 function updateConnectionStatus(connected) {
-    elements.connectionStatus.className =
+    elements.wsStatus.className =
         `connection-status ${connected ? 'online' : 'offline'}`;
-    elements.connectionStatus.querySelector('.status-text').textContent =
-        connected ? 'Connected' : 'Disconnected';
+    elements.wsStatus.querySelector('.status-text').textContent =
+        connected ? 'Server' : 'Server';
+}
+
+/**
+ * Update MQTT connection status indicator
+ */
+function updateMqttStatus(connected) {
+    elements.mqttStatus.className =
+        `connection-status ${connected ? 'online' : 'offline'}`;
+    elements.mqttStatus.querySelector('.status-text').textContent = 'MQTT';
+}
+
+/**
+ * Update Gateway connection status indicator
+ */
+function updateGatewayStatus(connected) {
+    elements.gatewayStatus.className =
+        `connection-status ${connected ? 'online' : 'offline'}`;
+    elements.gatewayStatus.querySelector('.status-text').textContent = 'Gateway';
 }
 
 /**

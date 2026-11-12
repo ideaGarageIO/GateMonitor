@@ -9,6 +9,7 @@ dependencies = [
     "uvicorn[standard]>=0.27.0",
     "paho-mqtt>=2.0.0",
     "python-dotenv>=1.0.0",
+    "aiosqlite>=0.22.1",
 ]
 
 [project.optional-dependencies]
@@ -31,3 +32,10 @@ packages = ["src/gate_monitor"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+]
