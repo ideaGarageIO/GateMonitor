@@ -1,0 +1,3 @@
+# Managed by scripts/provision-home-server.sh — regenerated on each run.
+# Without latitude/longitude here, HA uses the location chosen during onboarding.
+packages: !include_dir_named packages

@@ -1,18 +1,42 @@
-import { useEffect, useState } from "react";
-import { useGateSocket } from "./useGateSocket";
-import { StatusCard } from "./components/StatusCard";
-import { Controls } from "./components/Controls";
-import { History } from "./components/History";
-import { LiveChart } from "./components/LiveChart";
-import { clockTime } from "./format";
+import { useEffect, useMemo, useState } from "react";
+import { useFarmSocket } from "./useFarmSocket";
+import { computeAlerts } from "./alerts";
+import { Pill } from "./components/ui";
+import { OverviewPage } from "./pages/OverviewPage";
+import { GatePage } from "./pages/GatePage";
+import { CoopsPage } from "./pages/CoopsPage";
+import { SolarPage } from "./pages/SolarPage";
 
-const WINDOWS = [
-  { label: "5m", ms: 5 * 60_000 },
-  { label: "15m", ms: 15 * 60_000 },
-  { label: "1h", ms: 60 * 60_000 },
+export type Tab = "overview" | "gate" | "coops" | "solar";
+
+const TABS: { id: Tab; label: string; icon: string }[] = [
+  { id: "overview", label: "Overview", icon: "◎" },
+  { id: "gate", label: "Gate", icon: "▤" },
+  { id: "coops", label: "Coops", icon: "⌂" },
+  { id: "solar", label: "Solar", icon: "☀" },
 ];
 
-/** Ticks once a second so relative times and the chart's time axis keep moving. */
+function tabFromHash(): Tab {
+  const h = window.location.hash.replace(/^#\/?/, "");
+  return (TABS.find((t) => t.id === h)?.id ?? "overview") as Tab;
+}
+
+/** Hash routing (#/gate, #/coops...) — works behind any static server and from a home-screen icon. */
+function useTab(): [Tab, (t: Tab) => void] {
+  const [tab, setTab] = useState<Tab>(tabFromHash);
+  useEffect(() => {
+    const on = () => setTab(tabFromHash());
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  const go = (t: Tab) => {
+    window.location.hash = `/${t}`;
+    window.scrollTo({ top: 0 });
+  };
+  return [tab, go];
+}
+
+/** Ticks once a second so relative times and chart time axes keep moving. */
 function useNow(intervalMs = 1000): number {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -22,79 +46,78 @@ function useNow(intervalMs = 1000): number {
   return now;
 }
 
-function Indicator({ label, on, title }: { label: string; on: boolean; title: string }) {
+function Toast({ farm }: { farm: ReturnType<typeof useFarmSocket> }) {
+  const [visible, setVisible] = useState(false);
+  const r = farm.lastResult;
+  useEffect(() => {
+    if (!r) return;
+    setVisible(true);
+    const id = window.setTimeout(() => setVisible(false), 3000);
+    return () => window.clearTimeout(id);
+  }, [r]);
+  if (!r || !visible) return null;
+  const ok = r.result.status === "sent";
   return (
-    <div className={`pill ${on ? "online" : "offline"}`} title={title}>
-      <span className="dot" />
-      {label}
+    <div className={`toast ${ok ? "ok" : "error"}`} role="status">
+      {ok ? `Sent ${r.result.command} to ${r.result.device}` : `Command failed: ${r.result.error}`}
     </div>
   );
 }
 
 export function App() {
-  const { socketState, status, readings, history, sendCommand } = useGateSocket();
+  const farm = useFarmSocket();
   const now = useNow();
-  const [windowMs, setWindowMs] = useState(WINDOWS[0].ms);
-  const connected = socketState === "open";
+  const [tab, go] = useTab();
+  const connected = farm.socketState === "open";
+  const alerts = useMemo(
+    () => computeAlerts(farm.socketState, farm.gate, farm.devices, now),
+    [farm.socketState, farm.gate, farm.devices, now],
+  );
+  const alertCount = (t: Tab) => alerts.filter((a) => t === "overview" || a.tab === t).length;
+
+  useEffect(() => {
+    const n = alerts.filter((a) => a.level === "critical").length;
+    document.title = n ? `(${n}) Farm Monitor` : "Farm Monitor";
+  }, [alerts]);
 
   return (
     <div className="container">
       <header>
-        <h1>Gate Monitor</h1>
+        <h1>Farm Monitor</h1>
         <div className="indicators">
-          <Indicator label="Server" on={connected} title="WebSocket connection to server" />
-          <Indicator label="MQTT" on={connected && !!status?.mqtt_connected} title="MQTT broker connection" />
-          <Indicator label="Gateway" on={connected && !!status?.gateway_online} title="House gateway heartbeat" />
+          <Pill on={connected} title="WebSocket connection to server">Server</Pill>
+          <Pill on={connected && !!farm.gate?.mqtt_connected} title="MQTT broker connection">MQTT</Pill>
+          <Pill on={connected && !!farm.gate?.gateway_online} title="House gateway heartbeat">Gateway</Pill>
         </div>
       </header>
 
-      <main className="grid">
-        <StatusCard status={status} now={now} />
-        <Controls connected={connected} onCommand={sendCommand} />
+      <nav className="tabs" aria-label="Monitors">
+        {TABS.map((t) => {
+          const n = alertCount(t.id);
+          return (
+            <a
+              key={t.id}
+              href={`#/${t.id}`}
+              className="tab"
+              aria-current={tab === t.id ? "page" : undefined}
+            >
+              <span className="tab-icon" aria-hidden>{t.icon}</span>
+              <span className="tab-label">{t.label}</span>
+              {n > 0 && <span className="tab-badge" aria-label={`${n} alerts`}>{n}</span>}
+            </a>
+          );
+        })}
+      </nav>
 
-        <section className="card telemetry-card">
-          <div className="card-head">
-            <h2>Live Telemetry</h2>
-            <div className="segmented" role="group" aria-label="Time window">
-              {WINDOWS.map((w) => (
-                <button key={w.label} aria-pressed={windowMs === w.ms} onClick={() => setWindowMs(w.ms)}>
-                  {w.label}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="charts">
-            <LiveChart title="Battery" unit="V" field="battery_v" digits={2} minSpan={0.2}
-              readings={readings} windowMs={windowMs} now={now} />
-            <LiveChart title="Signal (RSSI)" unit="dBm" field="rssi" minSpan={10}
-              readings={readings} windowMs={windowMs} now={now} />
-            <LiveChart title="SNR" unit="dB" field="snr" digits={1} minSpan={4}
-              readings={readings} windowMs={windowMs} now={now} />
-          </div>
-          <details className="table-view">
-            <summary>Show readings table</summary>
-            <table>
-              <thead>
-                <tr><th>Time</th><th>Battery (V)</th><th>RSSI (dBm)</th><th>SNR (dB)</th></tr>
-              </thead>
-              <tbody>
-                {readings.slice(-15).reverse().map((r) => (
-                  <tr key={r.t}>
-                    <td>{clockTime(r.t)}</td>
-                    <td>{r.battery_v.toFixed(2)}</td>
-                    <td>{r.rssi}</td>
-                    <td>{r.snr}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </details>
-        </section>
-
-        <History entries={history} now={now} />
+      <main>
+        {tab === "overview" && <OverviewPage farm={farm} now={now} alerts={alerts} go={go} />}
+        {tab === "gate" && <GatePage farm={farm} now={now} />}
+        {tab === "coops" && <CoopsPage farm={farm} now={now} />}
+        {tab === "solar" && <SolarPage farm={farm} now={now} />}
       </main>
 
-      <footer>Gate Monitor v0.2.0</footer>
+      <Toast farm={farm} />
+      <footer>Farm Monitor v0.2.0</footer>
     </div>
   );
 }

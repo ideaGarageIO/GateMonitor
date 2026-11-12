@@ -14,6 +14,7 @@ const BUTTONS: { cmd: GateCommand; label: string; icon: string }[] = [
   { cmd: "close", label: "Close", icon: "▼" },
 ];
 
+/** Gate open/stop/close. `onCommand` returns false when the socket is down. */
 export function Controls({ connected, onCommand }: Props) {
   const [feedback, setFeedback] = useState<Feedback>(null);
 

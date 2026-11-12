@@ -7,8 +7,13 @@ publishes commands to control the gate.
 
 import json
 import logging
+import os
+import socket
 from datetime import datetime
 from typing import Any, Callable, Optional
+
+TopicHandler = Callable[[str, str], None]
+ConnectHandler = Callable[[], None]
 
 import paho.mqtt.client as mqtt
 
@@ -45,6 +50,8 @@ class MQTTClient:
     TOPIC_RSSI = "gate/rssi"
     TOPIC_ONLINE = "gate/online"
     TOPIC_GATEWAY_HEARTBEAT = "gateway/heartbeat"
+    TOPIC_SERVER_STATUS = "gatemonitor/status"  # retained online/offline (LWT)
+    EXTRA_SUBSCRIPTIONS = ("coop/#", "solar/#", "homeassistant/status")
     GATEWAY_TIMEOUT_MS = 2000  # 2 seconds (4 missed heartbeats at 2Hz)
 
     def __init__(
@@ -67,13 +74,16 @@ class MQTTClient:
         self.username = username
         self.password = password
 
-        self.client = mqtt.Client(
-            mqtt.CallbackAPIVersion.VERSION2,
-            client_id="gate_monitor_server",
-        )
+        # Unique per process: brokers disconnect an existing session when a
+        # second client connects with the same id (e.g. dev box + Pi).
+        client_id = os.getenv("MQTT_CLIENT_ID") or f"gate_monitor_{socket.gethostname()}_{os.getpid()}"
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id[:64])
 
         if username and password:
             self.client.username_pw_set(username, password)
+        # Broker marks the server offline if we drop without saying goodbye.
+        self.client.will_set(self.TOPIC_SERVER_STATUS, "offline", qos=1, retain=True)
+        self.client.reconnect_delay_set(min_delay=1, max_delay=30)
 
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
@@ -84,6 +94,9 @@ class MQTTClient:
         self.max_history = 100
         self._status_callbacks: list[Callable[[GateStatus], None]] = []
         self._connected = False
+        self._topic_handlers: list[tuple[str, TopicHandler]] = []
+        self._connect_handlers: list[ConnectHandler] = []
+        self.last_command: Optional[Command] = None
 
         # Gateway heartbeat tracking
         self._last_gateway_heartbeat: Optional[datetime] = None
@@ -163,27 +176,44 @@ class MQTTClient:
         if callback in self._status_callbacks:
             self._status_callbacks.remove(callback)
 
+    def add_topic_handler(self, prefix: str, handler: TopicHandler) -> None:
+        """Route messages whose topic starts with ``prefix`` to ``handler(topic, payload)``.
+
+        Handlers run on the paho network thread; hop to asyncio before touching
+        async state.
+        """
+        self._topic_handlers.append((prefix, handler))
+
+    def add_connect_handler(self, handler: ConnectHandler) -> None:
+        """Call ``handler()`` (on the network thread) after every successful (re)connect."""
+        self._connect_handlers.append(handler)
+
+    def publish(self, topic: str, payload: str, retain: bool = False, qos: int = 0) -> bool:
+        """Publish a message. Returns False (and drops it) when not connected."""
+        if not self._connected:
+            return False
+        self.client.publish(topic, payload, qos=qos, retain=retain)
+        return True
+
     def connect(self) -> None:
-        """Connect to the MQTT broker.
+        """Start connecting to the MQTT broker in the background.
 
-        Establishes a connection to the broker and starts the network
-        loop in a background thread.
-
-        Raises:
-            ConnectionRefusedError: If the broker refuses the connection.
-            OSError: If the broker is unreachable.
+        Uses paho's async connect so the server starts even when the broker
+        is down, and keeps retrying (1s -> 30s backoff) until it comes up.
         """
         logger.info("Connecting to MQTT broker at %s:%d", self.host, self.port)
-        self.client.connect(self.host, self.port, keepalive=60)
+        self.client.connect_async(self.host, self.port, keepalive=60)
         self.client.loop_start()
 
     def disconnect(self) -> None:
         """Disconnect from the MQTT broker.
 
-        Stops the network loop and cleanly disconnects from the broker.
+        Publishes the offline status, then stops the network loop.
         """
-        self.client.loop_stop()
+        if self._connected:
+            self.client.publish(self.TOPIC_SERVER_STATUS, "offline", qos=1, retain=True)
         self.client.disconnect()
+        self.client.loop_stop()
         logger.info("Disconnected from MQTT broker")
 
     def send_command(self, command: Command) -> None:
@@ -221,7 +251,15 @@ class MQTTClient:
             self._connected = True
             client.subscribe("gate/#")
             client.subscribe("gateway/#")
-            logger.info("Subscribed to gate/# and gateway/# topics")
+            for topic in self.EXTRA_SUBSCRIPTIONS:
+                client.subscribe(topic)
+            logger.info("Subscribed to gate/#, gateway/#, %s", ", ".join(self.EXTRA_SUBSCRIPTIONS))
+            client.publish(self.TOPIC_SERVER_STATUS, "online", qos=1, retain=True)
+            for handler in self._connect_handlers:
+                try:
+                    handler()
+                except Exception:  # noqa: BLE001
+                    logger.exception("MQTT connect handler failed")
         else:
             logger.error("MQTT connection failed with code %d", rc)
             self._connected = False
@@ -230,7 +268,8 @@ class MQTTClient:
         self,
         client: mqtt.Client,
         userdata: Any,
-        rc: int,
+        flags: Any,
+        rc: Any,
         properties: Any = None,
     ) -> None:
         """Handle MQTT disconnection events.
@@ -242,7 +281,7 @@ class MQTTClient:
             properties: MQTT v5 properties (optional).
         """
         self._connected = False
-        logger.warning("Disconnected from MQTT broker (rc=%d)", rc)
+        logger.warning("Disconnected from MQTT broker (rc=%s)", rc)
 
     def _on_message(
         self,
@@ -279,6 +318,15 @@ class MQTTClient:
                 self._notify_callbacks()
             elif topic == self.TOPIC_GATEWAY_HEARTBEAT:
                 self._handle_gateway_heartbeat(payload)
+            elif topic == self.TOPIC_COMMAND:
+                # Seen from any source (web UI, Home Assistant, CLI); used to
+                # tell "opening" from "closing" while the gate is MOVING.
+                self.last_command = Command.from_string(payload)
+                self._notify_callbacks()
+            else:
+                for prefix, handler in self._topic_handlers:
+                    if topic.startswith(prefix):
+                        handler(topic, payload)
         except ValueError as e:
             logger.error("Error parsing MQTT message value: %s", e)
         except Exception as e:

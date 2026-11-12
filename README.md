@@ -1,6 +1,9 @@
 # Gate Monitor
 
-LoRa-based IoT system for remote monitoring and control of a motorized sliding gate.
+LoRa-based IoT system for remote monitoring and control of a motorized sliding
+gate, growing into a farm monitor: chicken coop doors and solar charge status
+(simulated until that hardware exists), a live React dashboard, and Home
+Assistant integration for phone control.
 
 ## Overview
 
@@ -9,12 +12,12 @@ This project uses two Heltec ESP32 LoRa V3 boards to communicate over 915MHz LoR
 ### Architecture
 
 ```
-[Gate Node]  ──LoRa 915MHz──  [House Gateway]  ──MQTT──  [Raspberry Pi]
-  ESP32 V3                       ESP32 V3                  Web Server
-  - Limit switches               - LoRa ↔ WiFi bridge      - Mosquitto
-  - Optocoupler control          - MQTT publisher          - Dashboard
-  - Deep sleep                                             - Real-time UI
-  - Battery monitoring
+[Gate Node]  ──LoRa 915MHz──  [House Gateway]  ──MQTT──  [Home server (Docker)]
+  ESP32 V3                       ESP32 V3                  - Mosquitto broker
+  - Limit switches               - LoRa ↔ WiFi bridge      - Gate Monitor: React dashboard,
+  - Optocoupler control          - MQTT publisher            history, coop/solar simulator
+  - Deep sleep                                             - Home Assistant: phone app,
+  - Battery monitoring                                       alerts, automations
 ```
 
 ## Project Structure
@@ -26,10 +29,13 @@ GateMonitor/
 │   ├── house_gateway/      # House-side ESP32 (LoRa-MQTT bridge)
 │   └── lib/                # Shared libraries
 │       └── gate_protocol/  # Common message protocol
-├── server/                 # Raspberry Pi web server
+├── server/                 # Web server
 │   ├── src/gate_monitor/   # Python FastAPI application
-│   ├── static/             # Frontend (HTML/CSS/JS)
+│   ├── frontend/           # React + TypeScript dashboard (Vite)
+│   ├── scripts/            # Mock gateway, retained-message cleanup
 │   └── tests/              # Server tests
+├── deploy/                 # Docker Compose + Home Assistant config for the home server
+├── scripts/                # provision-home-server.sh, ha_bootstrap.py, legacy Pi setup
 ├── hardware/               # Hardware design files
 │   ├── schematics/         # Circuit schematics
 │   └── pcb/                # PCB designs (Flux.ai/KiCad)
@@ -57,24 +63,25 @@ GateMonitor/
 # See firmware/README.md for detailed instructions
 ```
 
-### 2. Set Up Raspberry Pi
+### 2. Provision the home server
 
 ```bash
-cd server
-
-# Install dependencies (using uv)
-uv sync
-
-# Configure MQTT broker
-sudo cp ../config/mosquitto/gate_monitor.conf /etc/mosquitto/conf.d/
-
-# Run the server
-uv run gate-monitor
+sudo ./scripts/provision-home-server.sh --lat <lat> --lon <lon> --country US \
+     --ha-user farm --ha-password '<password>'
 ```
 
-### 3. Access Dashboard
+This installs Docker, Mosquitto (with passwords), Home Assistant and Gate
+Monitor, then prints the MQTT credentials for the gateway firmware. See
+[deploy/README.md](deploy/README.md), including how to migrate from the old
+native Pi setup.
 
-Open `http://<raspberry-pi-ip>:8000` in your browser.
+### 3. Use it
+
+- Dashboard: `http://<server-ip>:8000`, with Overview / Gate / Coops / Solar tabs and live charts
+- Home Assistant: `http://<server-ip>:8123`, plus the Companion app on your phone, the
+  **Farm** dashboard and lock-screen "Close gate" alerts
+
+For development without hardware, see [server/README.md](server/README.md).
 
 ## Communication Protocol
 
@@ -94,6 +101,10 @@ Open `http://<raspberry-pi-ip>:8000` in your browser.
 | `gate/status` | Gateway → Server | JSON status object |
 | `gate/command` | Server → Gateway | `OPEN`, `CLOSE`, `STOP` |
 | `gate/battery` | Gateway → Server | Battery voltage (mV) |
+| `coop/<id>/state`, `solar/<id>/state` | Device → Server | JSON (see docs) |
+
+Full contract, including the coop/solar payloads for future hardware and the
+Home Assistant discovery topics: [docs/mqtt-topics.md](docs/mqtt-topics.md).
 
 ## Development
 
@@ -107,8 +118,9 @@ Requires Arduino IDE with Heltec ESP32 board support:
 
 ```bash
 cd server
-uv sync --dev
+uv sync --group dev
 uv run pytest
+uv run gate-monitor & uv run python scripts/mock_gateway.py   # full stack, no hardware
 ```
 
 ## License

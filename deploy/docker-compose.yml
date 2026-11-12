@@ -1,0 +1,69 @@
+# Farm monitor home server: Mosquitto + Home Assistant + Gate Monitor.
+#
+# Normally installed by scripts/provision-home-server.sh, which copies this
+# directory to /opt/farm-monitor, generates broker passwords into .env and
+# mosquitto/passwd, and runs `docker compose up -d`.
+#
+# Everything uses host networking: the ESP32 gateway reaches the broker at
+# <server-ip>:1883, Home Assistant can discover LAN devices (mDNS/SSDP), and
+# services talk to each other on localhost.
+
+name: farm-monitor
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.20
+    container_name: mosquitto
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd:ro
+      - mosquitto-data:/mosquitto/data
+    profiles: ["broker"] # skipped with --external-broker
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -h 127.0.0.1 -p 1883 -u \"$$HEALTH_USER\" -P \"$$HEALTH_PASSWORD\" -t '$$SYS/broker/uptime' -C 1 -W 3 >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    environment:
+      HEALTH_USER: ${MQTT_SERVER_USER}
+      HEALTH_PASSWORD: ${MQTT_SERVER_PASSWORD}
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:${HA_VERSION:-2026.11.1}
+    container_name: homeassistant
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./homeassistant/config:/config
+      - /etc/localtime:/etc/localtime:ro
+      - /run/dbus:/run/dbus:ro # Bluetooth integrations
+    cap_add: [NET_ADMIN, NET_RAW] # Bluetooth adapter recovery
+
+  gate-monitor:
+    build: ${GATE_MONITOR_SRC:-../server}
+    image: gate-monitor:local
+    container_name: gate-monitor
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      PORT: ${GATE_MONITOR_PORT:-8000}
+      MQTT_HOST: ${MQTT_HOST:-127.0.0.1}
+      MQTT_PORT: ${MQTT_PORT:-1883}
+      MQTT_USER: ${MQTT_SERVER_USER}
+      MQTT_PASSWORD: ${MQTT_SERVER_PASSWORD}
+      SIMULATE_DEVICES: ${SIMULATE_DEVICES:-true}
+      HA_DISCOVERY: "true"
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      LATITUDE: ${LATITUDE:-40.0}
+      LONGITUDE: ${LONGITUDE:--105.0}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - gate-monitor-data:/data
+
+volumes:
+  mosquitto-data:
+  gate-monitor-data:

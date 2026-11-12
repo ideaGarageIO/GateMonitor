@@ -1,0 +1,128 @@
+# Farm dashboard (YAML mode). Shown in the HA sidebar as "Farm" and is the
+# page phone notifications open. Built from stock cards only.
+
+title: Farm
+views:
+  - title: Farm
+    path: farm
+    icon: mdi:barn
+    type: sections
+    max_columns: 3
+    sections:
+      - type: grid
+        cards:
+          - type: heading
+            heading: Gate
+            icon: mdi:gate
+          - type: tile
+            entity: cover.farm_gate
+            name: Farm gate
+            vertical: false
+            grid_options: { columns: full }
+            features:
+              - type: cover-open-close
+          - type: tile
+            entity: sensor.farm_gate_battery
+            name: Battery
+          - type: tile
+            entity: sensor.farm_gate_rssi
+            name: Signal
+          - type: tile
+            entity: binary_sensor.farm_gate_link
+            name: LoRa link
+          - type: tile
+            entity: binary_sensor.farm_gate_gateway
+            name: Gateway
+          - type: history-graph
+            title: Gate battery
+            hours_to_show: 48
+            grid_options: { columns: full }
+            entities:
+              - entity: sensor.farm_gate_battery_voltage
+                name: Battery
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Chicken coops
+            icon: mdi:home-roof
+          - type: tile
+            entity: cover.coop_doors
+            name: All coop doors
+            grid_options: { columns: full }
+            features:
+              - type: cover-open-close
+          - type: tile
+            entity: cover.main_coop_door
+            name: Main coop
+            features:
+              - type: cover-open-close
+          - type: tile
+            entity: cover.brooder_door
+            name: Brooder
+            features:
+              - type: cover-open-close
+          - type: tile
+            entity: sensor.main_coop_temperature
+            name: Main coop
+          - type: tile
+            entity: sensor.brooder_temperature
+            name: Brooder
+          - type: tile
+            entity: switch.main_coop_auto_schedule
+            name: Main schedule
+          - type: tile
+            entity: switch.brooder_auto_schedule
+            name: Brooder schedule
+          - type: tile
+            entity: sensor.main_coop_next_close
+            name: Closes
+            grid_options: { columns: full }
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Solar
+            icon: mdi:solar-power-variant
+          - type: gauge
+            entity: sensor.barn_solar_soc
+            name: Battery
+            min: 0
+            max: 100
+            needle: true
+            severity: { green: 50, yellow: 25, red: 0 }
+          - type: tile
+            entity: sensor.barn_solar_panel_w
+            name: Panel
+          - type: tile
+            entity: sensor.barn_solar_load_w
+            name: Load
+          - type: tile
+            entity: sensor.barn_solar_charge_state
+            name: Charging
+          - type: tile
+            entity: sensor.barn_solar_yield_today
+            name: Today
+          - type: history-graph
+            title: Power
+            hours_to_show: 24
+            grid_options: { columns: full }
+            entities:
+              - entity: sensor.barn_solar_panel_w
+                name: Panel
+              - entity: sensor.barn_solar_load_w
+                name: Load
+
+      - type: grid
+        cards:
+          - type: heading
+            heading: Alerts
+            icon: mdi:bell
+          - type: tile
+            entity: input_boolean.farm_alerts_muted
+            name: Mute alerts
+          - type: entities
+            grid_options: { columns: full }
+            entities:
+              - entity: input_number.farm_gate_open_alert_minutes
+              - entity: input_text.farm_notify_service

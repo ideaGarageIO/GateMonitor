@@ -1,161 +1,127 @@
-# Gate Monitor Server
+# Gate / Farm Monitor Server
 
-Python web server for the gate monitoring system. Runs on Raspberry Pi.
+FastAPI server plus a React + TypeScript dashboard for the farm. It covers the
+LoRa gate, chicken coop doors and the solar charge controller. Values stream to
+the browser live over a WebSocket. The server keeps history in SQLite and
+announces every device to Home Assistant through MQTT discovery.
+
+> **Deploying to the home server?** Use `../scripts/provision-home-server.sh`.
+> It runs this server, Mosquitto and Home Assistant in Docker. See
+> [`../deploy/README.md`](../deploy/README.md). The rest of this page covers
+> development.
 
 ## Features
 
-- Real-time React + TypeScript dashboard with live telemetry charts (WebSocket)
-- MQTT integration with gateway
-- Command forwarding to gate
-- Status history
+- **Tabs.** Overview (alerts, tiles for every device, quick gate control),
+  Gate, Coops and Solar. Each page uses hash URLs (`#/coops`) so it can be
+  bookmarked, and the tabs become a bottom bar on phones. The page can be
+  installed to a phone's home screen.
+- **Live charts.** Gate battery, RSSI and SNR; coop temperature; solar panel
+  power, state of charge and load. Windows of 5m, 15m or 1h, a hover readout,
+  and backfill from SQLite on page load.
+- **Controls.** Gate open/stop/close. Coop door open/stop/close and the
+  sunrise/sunset schedule switch.
+- **Activity log.** Gate and coop door state changes and online/offline
+  transitions, stored in SQLite.
+- **Alerts in the UI.** Server, MQTT or gateway offline; gate error; low
+  batteries; a jammed coop door; a coop door open after dark; low solar charge.
+- **Simulator.** Two coops and one solar array, so everything works before the
+  hardware exists (`SIMULATE_DEVICES=true`).
+- **Home Assistant.** MQTT discovery for a gate cover, coop door covers, sensors
+  and switches. See [`../docs/mqtt-topics.md`](../docs/mqtt-topics.md).
 
-## Requirements
-
-- Python 3.10+
-- Mosquitto MQTT broker
-
-## Installation
-
-### 1. Install Mosquitto
-
-```bash
-sudo apt update
-sudo apt install mosquitto mosquitto-clients
-
-# Copy configuration
-sudo cp ../config/mosquitto/gate_monitor.conf /etc/mosquitto/conf.d/
-sudo systemctl restart mosquitto
-```
-
-### 2. Install Python Dependencies
-
-Using [uv](https://github.com/astral-sh/uv) (recommended):
+## Run it (development)
 
 ```bash
-# Install uv if not already installed
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Install dependencies
 cd server
 uv sync
+uv run gate-monitor                          # http://localhost:8000
+uv run python scripts/mock_gateway.py        # optional: fake gate + gateway (obeys commands)
 ```
 
-Or using pip:
+You need a broker on `MQTT_HOST` (default `localhost:1883`). Without one, the
+server still starts and keeps retrying. Simulated coops and solar still work,
+but gate commands return `503`.
+
+### Frontend
+
+The built dashboard is served from `frontend/dist/`. After changing frontend
+code:
 
 ```bash
-cd server
-pip install -e .
+cd frontend
+npm install && npm run build      # or, without Node installed:
+docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/app -w /app node:22-alpine sh -c "npm install && npm run build"
 ```
 
-### 3. Configure Environment
+For hot reload, run `npm run dev` and open http://localhost:5173. Vite passes
+`/api` and `/ws` through to the server on `:8000` (set `GATE_BACKEND` to change
+that).
+
+### Docker
 
 ```bash
-cp .env.example .env
-# Edit .env with your settings
+docker build -t gate-monitor .    # builds the frontend too; no Node needed
+docker run --network host -e MQTT_HOST=127.0.0.1 -v gm-data:/data gate-monitor
 ```
 
-### 4. Build the Frontend
+## Configuration
 
-The dashboard lives in `frontend/` (React + TypeScript, Vite). It needs Node 20+
-(or build it anywhere and copy `frontend/dist/` to the Pi).
+Set these in the environment or in `.env`. The full list with defaults is in
+[`.env.example`](.env.example). The main ones:
 
-```bash
-cd server/frontend
-npm install
-npm run build          # outputs frontend/dist/, served by FastAPI at /
-```
+| Variable | Default | |
+|---|---|---|
+| `MQTT_HOST` / `MQTT_PORT` / `MQTT_USER` / `MQTT_PASSWORD` | `localhost` / `1883` | Broker |
+| `SIMULATE_DEVICES` | `true` | Run simulated coops and solar |
+| `LATITUDE` / `LONGITUDE` | `40.0` / `-105.0` | Sunrise/sunset for the simulator |
+| `HA_DISCOVERY` | `true` | Publish Home Assistant discovery |
+| `DB_PATH` | `./data/gate_monitor.db` | SQLite history |
+| `HISTORY_DAYS` | `30` | Telemetry retention |
 
-No Node on the machine? Build in a container:
-
-```bash
-docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/app -w /app \
-  node:22-alpine sh -c "npm install && npm run build"
-```
-
-If `frontend/dist/` is missing, the server falls back to the legacy page in `static/`.
-
-## Running
-
-### Development
-
-```bash
-cd server
-uv run gate-monitor
-
-# Or with auto-reload
-DEBUG=true uv run gate-monitor
-```
-
-### Frontend development (hot reload)
-
-Run the API server, then the Vite dev server, which proxies `/api` and `/ws` to it:
-
-```bash
-uv run gate-monitor                 # terminal 1, port 8000
-cd frontend && npm run dev          # terminal 2, open http://localhost:5173
-```
-
-### Mock gateway (no hardware)
-
-Publishes fake heartbeat + gate status traffic to the broker so the charts move:
-
-```bash
-uv run python scripts/mock_gateway.py --interval 1
-```
-
-### Production (systemd)
-
-Create `/etc/systemd/system/gate-monitor.service`:
-
-```ini
-[Unit]
-Description=Gate Monitor Web Server
-After=network.target mosquitto.service
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/GateMonitor/server
-Environment=MQTT_HOST=localhost
-ExecStart=/home/pi/.local/bin/uv run gate-monitor
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start:
-
-```bash
-sudo systemctl enable gate-monitor
-sudo systemctl start gate-monitor
-```
-
-## API Endpoints
+## API
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Dashboard |
-| `/api/status` | GET | Current gate status |
-| `/api/history` | GET | Status history |
-| `/api/command/{cmd}` | POST | Send command (open/close/stop) |
-| `/ws` | WebSocket | Real-time updates |
+|---|---|---|
+| `/api/health` | GET | Versions and connectivity |
+| `/api/devices` | GET | `{gate, devices: [...]}` |
+| `/api/devices/{id}` | GET | One device (`gate`, `main-coop`, `barn-solar`, …) |
+| `/api/devices/{id}/command/{cmd}` | POST | Gate: `open` / `close` / `stop` / `status`. Coop: `open` / `close` / `stop` / `auto` / `manual`. |
+| `/api/readings/{id}?minutes=60` | GET | Stored telemetry `[{t, field: value}]`, thinned to ≤720 points |
+| `/api/events?device=&limit=50` | GET | Activity log |
+| `/api/status`, `/api/history`, `/api/command/{cmd}` | | Older gate-only endpoints, kept for compatibility |
+| `/ws` | WS | Live stream: `status`, `devices`, `device`, `event`, `command_result`. Send `{"type":"command","device":"main-coop","command":"close"}`. |
 
-## MQTT Topics
+## Scripts
 
-| Topic | Direction | Description |
-|-------|-----------|-------------|
-| `gate/status` | Subscribe | JSON status from gateway |
-| `gate/command` | Publish | Commands to gateway |
-| `gate/online` | Subscribe | Gate online status |
+| Script | |
+|---|---|
+| `scripts/mock_gateway.py` | Stands in for the LoRa gateway and gate on MQTT and responds to commands |
+| `scripts/clear_retained.py` | Removes simulated or test retained messages from the broker (dry run by default) |
 
 ## Testing
 
 ```bash
-# Run tests
-uv run pytest
+uv run --group dev pytest        # 36 tests: models, registry, simulator, HA discovery, DB, API/WebSocket
+cd frontend && npm run typecheck
+```
 
-# Test MQTT manually
-mosquitto_sub -h localhost -t "gate/#" -v
+## Layout
+
+```
+src/gate_monitor/
+  main.py           FastAPI app: wiring, REST, WebSocket, frontend
+  mqtt_client.py    paho client: gate topics, generic topic handlers, LWT, reconnect
+  devices.py        coop/solar models and registry
+  simulator.py      simulated coops and solar
+  sun.py            sunrise/sunset maths
+  homeassistant.py  MQTT discovery payloads
+  database.py       SQLite history
+  models.py         gate models (match firmware gate_protocol.h)
+frontend/src/
+  useFarmSocket.ts  WebSocket and state for every device
+  pages/            Overview, Gate, Coops, Solar
+  components/       LiveChart (SVG), StatusCard, Controls, shared UI
+  alerts.ts         alert rules for the Overview tab
+static/             old vanilla-JS page (fallback when frontend/dist is missing)
 ```

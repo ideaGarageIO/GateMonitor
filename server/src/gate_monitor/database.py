@@ -5,6 +5,8 @@ including battery voltage, signal strength, and state changes.
 Uses aiosqlite for async database operations with FastAPI.
 """
 
+import json
+
 import aiosqlite
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -73,6 +75,29 @@ class Database:
 
             CREATE INDEX IF NOT EXISTS idx_state_changes_timestamp
                 ON state_changes(timestamp);
+
+            -- Generic telemetry for coops, solar, and future devices.
+            -- ts is epoch milliseconds so range queries stay numeric.
+            CREATE TABLE IF NOT EXISTS device_readings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_device_readings_device_ts
+                ON device_readings(device_id, ts);
+
+            -- Human-meaningful events (door opened, gate closed, went offline...)
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                detail TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         """)
         await self._connection.commit()
 
@@ -347,6 +372,62 @@ class Database:
                 (row["online_count"] / row["count"]) * 100, 1
             ) if row["count"] > 0 else 0,
         }
+
+
+    # ----------------------------------------------------------- generic API
+
+    async def record_device_reading(self, device_id: str, data: dict[str, Any], ts_ms: int) -> None:
+        """Store one telemetry sample (numeric fields only) for any device."""
+        numeric = {k: v for k, v in data.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        await self._connection.execute(
+            "INSERT INTO device_readings (device_id, ts, data) VALUES (?, ?, ?)",
+            (device_id, ts_ms, json.dumps(numeric, separators=(",", ":"))),
+        )
+        await self._connection.commit()
+
+    async def get_device_readings(
+        self, device_id: str, since_ms: int, max_points: int = 720
+    ) -> list[dict[str, Any]]:
+        """Readings since ``since_ms``, evenly thinned to at most ``max_points``."""
+        cursor = await self._connection.execute(
+            "SELECT ts, data FROM device_readings WHERE device_id = ? AND ts >= ? ORDER BY ts ASC",
+            (device_id, since_ms),
+        )
+        rows = await cursor.fetchall()
+        step = max(1, -(-len(rows) // max_points))  # ceil division
+        picked = rows[::step]
+        if rows and picked[-1] is not rows[-1]:
+            picked.append(rows[-1])  # always include the newest sample
+        return [{"t": row["ts"], **json.loads(row["data"])} for row in picked]
+
+    async def record_event(self, device_id: str, event: str, ts_ms: int, detail: Optional[str] = None) -> None:
+        await self._connection.execute(
+            "INSERT INTO events (device_id, ts, event, detail) VALUES (?, ?, ?, ?)",
+            (device_id, ts_ms, event, detail),
+        )
+        await self._connection.commit()
+
+    async def get_events(self, device_id: Optional[str] = None, limit: int = 50) -> list[dict[str, Any]]:
+        if device_id:
+            cursor = await self._connection.execute(
+                "SELECT device_id, ts, event, detail FROM events WHERE device_id = ? ORDER BY ts DESC LIMIT ?",
+                (device_id, limit),
+            )
+        else:
+            cursor = await self._connection.execute(
+                "SELECT device_id, ts, event, detail FROM events ORDER BY ts DESC LIMIT ?", (limit,)
+            )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def prune(self, keep_days: int) -> int:
+        """Delete telemetry older than ``keep_days``. Events are kept 4x longer."""
+        now_ms = int(datetime.now().timestamp() * 1000)
+        cutoff = now_ms - keep_days * 86_400_000
+        cur = await self._connection.execute("DELETE FROM device_readings WHERE ts < ?", (cutoff,))
+        removed = cur.rowcount
+        await self._connection.execute("DELETE FROM events WHERE ts < ?", (now_ms - 4 * keep_days * 86_400_000,))
+        await self._connection.commit()
+        return removed
 
 
 # Global database instance

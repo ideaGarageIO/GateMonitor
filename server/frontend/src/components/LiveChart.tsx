@@ -1,19 +1,20 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { Reading } from "../types";
+import type { Sample } from "../types";
 import { clockTime } from "../format";
-
-type Key = "battery_v" | "rssi" | "snr";
 
 interface Props {
   title: string;
   unit: string;
-  field: Key;
-  readings: Reading[];
+  field: string;
+  readings: Sample[];
   windowMs: number;
   now: number;
   digits?: number;
   /** Minimum visible y-span so a flat signal doesn't look like noise. */
   minSpan: number;
+  /** Hard y-limits for bounded quantities (power >= 0, percent <= 100). */
+  floor?: number;
+  ceil?: number;
 }
 
 const HEIGHT = 150;
@@ -26,7 +27,7 @@ function niceTicks(min: number, max: number, count = 3): number[] {
   return Array.from({ length: count }, (_, i) => min + step * i);
 }
 
-export function LiveChart({ title, unit, field, readings, windowMs, now, digits = 0, minSpan }: Props) {
+export function LiveChart({ title, unit, field, readings, windowMs, now, digits = 0, minSpan, floor, ceil }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(320);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -40,11 +41,12 @@ export function LiveChart({ title, unit, field, readings, windowMs, now, digits 
   }, []);
 
   const t0 = now - windowMs;
-  const visible = useMemo(() => readings.filter((r) => r.t >= t0), [readings, t0]);
-  const latest = readings[readings.length - 1];
+  const withField = useMemo(() => readings.filter((r) => Number.isFinite(r[field])), [readings, field]);
+  const visible = useMemo(() => withField.filter((r) => r.t >= t0), [withField, t0]);
+  const latest = withField[withField.length - 1];
 
   const [yMin, yMax] = useMemo(() => {
-    if (visible.length === 0) return [0, minSpan];
+    if (visible.length === 0) return [floor ?? 0, (floor ?? 0) + minSpan];
     let lo = Infinity;
     let hi = -Infinity;
     for (const r of visible) {
@@ -53,8 +55,13 @@ export function LiveChart({ title, unit, field, readings, windowMs, now, digits 
     }
     const span = Math.max(hi - lo, minSpan);
     const mid = (hi + lo) / 2;
-    return [mid - span * 0.6, mid + span * 0.6];
-  }, [visible, field, minSpan]);
+    let a = mid - span * 0.6;
+    let b = mid + span * 0.6;
+    if (floor !== undefined && a < floor) [a, b] = [floor, Math.max(b, floor + span * 1.1)];
+    if (ceil !== undefined && b > ceil) [a, b] = [Math.min(a, ceil - span * 1.1), ceil];
+    if (floor !== undefined) a = Math.max(a, floor);
+    return [a, b];
+  }, [visible, field, minSpan, floor, ceil]);
 
   const innerW = width - PAD.left - PAD.right;
   const innerH = HEIGHT - PAD.top - PAD.bottom;
@@ -70,7 +77,6 @@ export function LiveChart({ title, unit, field, readings, windowMs, now, digits 
       prevT = r.t;
     }
     return d;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, field, width, yMin, yMax, t0, windowMs]);
 
   const onPointerMove = (e: React.PointerEvent<SVGRectElement>) => {

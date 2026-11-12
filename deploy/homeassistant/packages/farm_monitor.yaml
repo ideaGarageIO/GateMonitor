@@ -1,0 +1,229 @@
+# Farm monitor package: helpers, phone notifications, and safety automations.
+#
+# Entity ids below are the ones gate-monitor's MQTT discovery creates
+# (cover.farm_gate, cover.main_coop_door, sensor.barn_solar_soc, ...). If you
+# rename devices or add coops, update the "Coop doors" group and the coop
+# triggers at the bottom.
+#
+# Helpers keep their values across restarts (no `initial:`), so set them once:
+# scripts/ha_bootstrap.py does it for you, or use the Farm dashboard.
+#
+# Phone setup (once):
+#   1. Install the Home Assistant Companion app and log in to this server.
+#   2. Set the "Farm notify service" helper to notify.mobile_app_<your_phone>
+#      (Developer tools -> Actions lists it). Until then alerts only appear
+#      in HA's notification bell.
+#   Notifications for "gate left open" / "coop still open" carry a button
+#   that closes it right from the lock screen.
+
+input_text:
+  farm_notify_service:
+    name: Farm notify service
+    icon: mdi:cellphone-message
+    max: 100
+
+input_number:
+  farm_gate_open_alert_minutes:
+    name: Alert when gate open longer than
+    icon: mdi:timer-alert
+    # A fresh install starts at the minimum, so the minimum is a sane default.
+    min: 5
+    max: 120
+    step: 5
+    unit_of_measurement: min
+    mode: box
+
+input_boolean:
+  # Off (the default on a fresh install) means alerts are sent.
+  farm_alerts_muted:
+    name: Mute farm alerts
+    icon: mdi:bell-off
+
+cover:
+  - platform: group
+    name: Coop doors
+    unique_id: farm_coop_doors
+    entities:
+      - cover.main_coop_door
+      - cover.brooder_door
+
+script:
+  farm_notify:
+    alias: Farm notify
+    description: Send a farm alert to the phone (and HA's notification bell).
+    mode: queued
+    fields:
+      title:
+        description: Notification title
+        example: Farm gate
+      message:
+        description: Notification body
+        example: The gate has been open for 10 minutes
+      actions:
+        description: Optional actionable-notification buttons
+        example: '[{"action": "FARM_CLOSE_GATE", "title": "Close gate"}]'
+      tag:
+        description: Replaces an earlier notification with the same tag
+        example: farm_gate_open
+    sequence:
+      - condition: state
+        entity_id: input_boolean.farm_alerts_muted
+        state: "off"
+      - action: persistent_notification.create
+        data:
+          title: "{{ title }}"
+          message: "{{ message }}"
+          notification_id: "{{ tag | default('farm_' ~ (now().timestamp() | int)) }}"
+      - variables:
+          service: "{{ states('input_text.farm_notify_service') }}"
+      - if: "{{ service.startswith('notify.') }}"
+        then:
+          - action: "{{ service }}"
+            continue_on_error: true
+            data:
+              title: "{{ title }}"
+              message: "{{ message }}"
+              data:
+                tag: "{{ tag | default('farm') }}"
+                group: farm
+                url: /farm-monitor/farm # opened when the notification is tapped (iOS)
+                clickAction: /farm-monitor/farm # (Android)
+                actions: "{{ actions | default([]) }}"
+
+automation:
+  # ------------------------------------------------------------------ gate
+  - id: farm_gate_left_open
+    alias: Farm — gate left open
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: cover.farm_gate
+        to: open
+        for:
+          minutes: "{{ states('input_number.farm_gate_open_alert_minutes') | int(10) }}"
+    actions:
+      - action: script.farm_notify
+        data:
+          title: Farm gate
+          message: >-
+            The gate has been open for
+            {{ states('input_number.farm_gate_open_alert_minutes') | int(10) }} minutes.
+          tag: farm_gate_open
+          actions:
+            - action: FARM_CLOSE_GATE
+              title: Close gate
+
+  - id: farm_gate_offline
+    alias: Farm — gate offline
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: cover.farm_gate
+        to: unavailable
+        for: { minutes: 5 }
+    actions:
+      - action: script.farm_notify
+        data:
+          title: Farm gate offline
+          message: >-
+            No word from the gate for 5 minutes. LoRa link:
+            {{ states('binary_sensor.farm_gate_link') }}, house gateway:
+            {{ states('binary_sensor.farm_gate_gateway') }}.
+          tag: farm_gate_offline
+
+  - id: farm_gate_battery_low
+    alias: Farm — gate battery low
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.farm_gate_battery
+        below: 20
+        for: { minutes: 30 }
+    actions:
+      - action: script.farm_notify
+        data:
+          title: Gate battery low
+          message: >-
+            Gate battery at {{ states('sensor.farm_gate_battery') }}%
+            ({{ states('sensor.farm_gate_battery_voltage') }} V).
+          tag: farm_gate_battery
+
+  # ----------------------------------------------------------------- coops
+  - id: farm_coop_open_after_dark
+    alias: Farm — coop door open after dark
+    mode: single
+    triggers:
+      - trigger: sun
+        event: sunset
+        offset: "01:00:00"
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ expand('cover.coop_doors') | rejectattr('state', 'eq', 'closed') | list | count > 0 }}
+    actions:
+      - action: script.farm_notify
+        data:
+          title: Coop door still open
+          message: >-
+            {{ expand('cover.coop_doors') | rejectattr('state', 'eq', 'closed')
+               | map(attribute='name') | join(', ') }} still open an hour after sunset.
+          tag: farm_coop_open
+          actions:
+            - action: FARM_CLOSE_COOPS
+              title: Close coop doors
+
+  - id: farm_coop_jammed
+    alias: Farm — coop door jammed
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id:
+          - binary_sensor.main_coop_door_jammed
+          - binary_sensor.brooder_door_jammed
+        to: "on"
+    actions:
+      - action: script.farm_notify
+        data:
+          title: Coop door jammed
+          message: "{{ trigger.to_state.name }} — check for an obstruction."
+          tag: "farm_jam_{{ trigger.entity_id }}"
+
+  # ----------------------------------------------------------------- solar
+  - id: farm_solar_low
+    alias: Farm — solar battery low
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.barn_solar_soc
+        below: 30
+        for: { minutes: 15 }
+    actions:
+      - action: script.farm_notify
+        data:
+          title: Solar battery low
+          message: "Barn solar battery at {{ states('sensor.barn_solar_soc') }}%."
+          tag: farm_solar_low
+
+  # ----------------------------------------- notification button handlers
+  - id: farm_notification_actions
+    alias: Farm — notification buttons
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data: { action: FARM_CLOSE_GATE }
+        id: gate
+      - trigger: event
+        event_type: mobile_app_notification_action
+        event_data: { action: FARM_CLOSE_COOPS }
+        id: coops
+    actions:
+      - choose:
+          - conditions: { condition: trigger, id: gate }
+            sequence:
+              - action: cover.close_cover
+                target: { entity_id: cover.farm_gate }
+          - conditions: { condition: trigger, id: coops }
+            sequence:
+              - action: cover.close_cover
+                target: { entity_id: cover.coop_doors }

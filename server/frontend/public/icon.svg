@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" rx="112" fill="#2a78d6"/>
+  <!-- farm gate: two posts, three rails and a diagonal brace -->
+  <g fill="none" stroke="#fff" stroke-width="30" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M120 140v250M392 140v250"/>
+    <path d="M120 190h272M120 265h272M120 340h272"/>
+    <path d="M135 335 377 195"/>
+  </g>
+</svg>
