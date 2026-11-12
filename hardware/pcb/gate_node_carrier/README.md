@@ -14,6 +14,9 @@ python3 gen_pcb.py --check   # placement sanity check only
 python3 gen_pcb.py           # -> gate_node_carrier.kicad_pcb (+ net classes in .kicad_pro)
 ```
 
+`python3 gen_bom.py` regenerates `bom_amazon.csv`, the discrete parts grouped
+into Amazon purchase lines. Its columns match the project's Google Sheet BOM.
+
 `python3 gen_3d.py` regenerates the placeholder 3D models in `gate_node.3dshapes/`.
 These are box models of the Heltec V3 (attached to J1) and the Mini360 (U1),
 written as VRML for the viewer and STEP for export.

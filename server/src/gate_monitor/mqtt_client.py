@@ -271,8 +271,12 @@ class MQTTClient:
                 self._handle_online(payload)
             elif topic == self.TOPIC_BATTERY:
                 self.status.battery_mv = int(payload)
+                self.status.last_update = datetime.now()
+                self._notify_callbacks()
             elif topic == self.TOPIC_RSSI:
                 self.status.rssi = int(payload)
+                self.status.last_update = datetime.now()
+                self._notify_callbacks()
             elif topic == self.TOPIC_GATEWAY_HEARTBEAT:
                 self._handle_gateway_heartbeat(payload)
         except ValueError as e:
@@ -315,6 +319,8 @@ class MQTTClient:
                 timestamp=self.status.last_update,
                 state=self.status.state,
                 battery_mv=self.status.battery_mv,
+                rssi=self.status.rssi,
+                snr=self.status.snr,
             )
             self.history.append(entry)
             if len(self.history) > self.max_history:

@@ -132,7 +132,7 @@ class GateStatus:
             "rssi": self.rssi,
             "snr": self.snr,
             "online": self.online,
-            "last_update": self.last_update.isoformat(),
+            "last_update": self.last_update.astimezone().isoformat(),
         }
 
 
@@ -147,11 +147,15 @@ class HistoryEntry:
         timestamp: When this state was recorded.
         state: The gate state at this time.
         battery_mv: Battery voltage in millivolts at this time.
+        rssi: Signal strength in dBm at this time.
+        snr: Signal-to-noise ratio in dB at this time.
     """
 
     timestamp: datetime
     state: GateState
     battery_mv: int
+    rssi: int = 0
+    snr: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert history entry to a dictionary for JSON serialization.
@@ -161,7 +165,9 @@ class HistoryEntry:
             voltage with JSON-serializable values.
         """
         return {
-            "timestamp": self.timestamp.isoformat(),
+            "timestamp": self.timestamp.astimezone().isoformat(),
             "state": str(self.state),
             "battery_mv": self.battery_mv,
+            "rssi": self.rssi,
+            "snr": self.snr,
         }

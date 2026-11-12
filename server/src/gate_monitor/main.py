@@ -41,7 +41,10 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_USER")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 
-STATIC_DIR = Path(__file__).parent.parent.parent / "static"
+SERVER_DIR = Path(__file__).parent.parent.parent
+# Built React frontend (see frontend/README.md); falls back to the legacy page.
+FRONTEND_DIST = SERVER_DIR / "frontend" / "dist"
+STATIC_DIR = SERVER_DIR / "static"
 
 # Global state
 mqtt_client: Optional[MQTTClient] = None
@@ -187,6 +190,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+if (FRONTEND_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -195,12 +200,14 @@ if STATIC_DIR.exists():
 async def root() -> Any:
     """Serve the main dashboard page.
 
+    Prefers the built React app in frontend/dist, then the legacy static page.
+
     Returns:
         The index.html file if it exists, otherwise an error dict.
     """
-    index_path = STATIC_DIR / "index.html"
-    if index_path.exists():
-        return FileResponse(index_path)
+    for index_path in (FRONTEND_DIST / "index.html", STATIC_DIR / "index.html"):
+        if index_path.exists():
+            return FileResponse(index_path)
     return {"error": "Frontend not found"}
 
 
